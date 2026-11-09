@@ -229,6 +229,12 @@ TxAngle to degrees like every other angle.
 
 ## Notes on the DFD
 
+pys7k is experimental. Its interfaces may change between releases. Only
+7125 data has been tested so far. Many record layouts were transcribed
+from the DFD and have only been tested with synthetic records, because no
+sample files contain them. Please check results against other tools
+before relying on them, and report any discrepancies.
+
 These points were checked against 7125 data from 2012 and 2016.
 
 * The checksum flag is Flags bit 0. The DFD's checksum row says bit 1,
