@@ -4,6 +4,10 @@ from setuptools import setup, find_packages
 
 _HERE = Path(__file__).resolve().parent
 _LONG_DESCRIPTION = (_HERE / "README.md").read_text(encoding="utf-8")
+# PyPI cannot resolve image paths relative to the repository, so point
+# README images at their copies on GitHub.
+_LONG_DESCRIPTION = _LONG_DESCRIPTION.replace(
+    'src="docs/', 'src="https://raw.githubusercontent.com/valschmidt/pys7k/main/docs/')
 
 setup(
     name="pys7k",
