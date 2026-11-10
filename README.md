@@ -1,3 +1,5 @@
+<img src="docs/images/ccom-jhc-logo.png" alt="UNH Center for Coastal and Ocean Mapping / Joint Hydrographic Center" width="96" align="right">
+
 # pys7k
 
 pys7k is a pure-Python library and command line utility for reading and
