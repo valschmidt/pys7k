@@ -35,7 +35,7 @@ from .frame import (CHECKSUM_SIZE, DRF_DTYPE, DRF_OFFSETS, DRF_SIZE, FLAG_CHECKS
 from .optional_data import recover_misplaced_optional_data
 from .verification import REAL_DATA_VERIFIED
 from .registry import (DEVICE_IDENTIFIERS, PING_RECORD_TYPES, RECORD_CODECS,
-                       MIN_DECODED_PROTOCOL, RECORD_TYPE_DESCRIPTIONS, decode_record,
+                       MIN_DECODED_PROTOCOL, RECORD_TYPE_DESCRIPTIONS, LEGACY_CODECS, decode_record,
                        detect_checksum_trailer, encode_record, new, record_name)
 
 __all__ = ["s7k", "resolve_record_type", "main"]
@@ -412,12 +412,16 @@ class s7k:
         })
         summary["% of File"] = (summary["Total Bytes"] / max(self.file_size, 1) * 100).round(2)
         modern = set(idx[idx.ProtocolVersion >= MIN_DECODED_PROTOCOL].RecordType.unique())
-        summary["Decoded"] = ["yes" if rt in RECORD_CODECS and rt in modern else "raw"
+        legacy = {rt for pv, rt in idx[idx.ProtocolVersion < MIN_DECODED_PROTOCOL][
+            ["ProtocolVersion", "RecordType"]].drop_duplicates().itertuples(index=False)
+            if (pv, rt) in LEGACY_CODECS}
+        summary["Decoded"] = ["yes" if (rt in RECORD_CODECS and rt in modern) or rt in legacy else "raw"
                               for rt in summary.index]
         # Whether the decoder has been checked against real files (see
-        # PYS7K.verification) or only against synthetic records.
+        # PYS7K.verification) or only against synthetic records. Every
+        # legacy (pre-protocol 5) codec was written from real files.
         summary["Real Data"] = ["" if d == "raw" else
-                                ("yes" if rt in REAL_DATA_VERIFIED else "no")
+                                ("yes" if rt in REAL_DATA_VERIFIED or rt in legacy else "no")
                                 for rt, d in zip(summary.index, summary["Decoded"])]
         if "ChecksumValid" in idx:
             cv = idx.ChecksumValid
@@ -706,8 +710,16 @@ def _print_record(rec, row, offset, buf, max_rows):
         print("-- Checksum: none  # the record has no checksum field (written without one)")
         return
     if frame["ProtocolVersion"] < MIN_DECODED_PROTOCOL:
-        print("-- Checksum: %d  # protocol version %d: Flags bit 0 is not a checksum flag"
-              % (stored, frame["ProtocolVersion"]))
+        if "RecordCount" in frame:
+            # Protocol 2 (DFD 0.42): "Bit 1 - Valid checksum", a sum of the
+            # data section only. No flagged record has been seen.
+            print("-- Checksum: %d  # protocol version %d: Flags %d, %s"
+                  % (stored, frame["ProtocolVersion"], frame["Flags"],
+                     "no checksum flagged" if not frame["Flags"] & 3 else
+                     "checksum (sum of the data section) flagged"))
+        else:
+            print("-- Checksum: %d  # protocol version %d: Flags bit 0 is not a checksum flag"
+                  % (stored, frame["ProtocolVersion"]))
         return
     if frame["Flags"] & FLAG_CHECKSUM_VALID:
         calc = checksum(buf[:len(buf) - CHECKSUM_SIZE])

@@ -23,6 +23,21 @@ keeps both wordings. On every sample file checked (7125 data from
 2012 and 2016, about 26,000 records) every record with bit 0 set has a
 matching checksum. Records with bit 0 clear (7200, 7300, 7777, and HYPACK's
 7008) store either zero or a value that does not match.
+
+Older frames
+------------
+DFD 3.10 is protocol version 5 (DFD 0.54 and later). Earlier DFDs, from
+the MB-System format archive, define the older frames:
+
+* Protocol 2 (DFD 0.32-0.47, 2002-2003): 72 bytes, ``DRF_V2`` below.
+  Bytes 0-39 and SystemEnumerator (byte 42) match protocol 5. Byte 40 is
+  SubsystemIdentifier, then come DataSet, RecordCount, the Previous and
+  Next record pointers, and Flags at byte 68. Read with the protocol-5
+  layout, RecordCount lands where Flags is. Its checksum is the sum of the
+  data section only, when flagged.
+* Protocol 3 (DFD 0.48-0.50) and 4 (DFD 0.51-0.53): not seen in any file
+  yet. Protocol 4 is already the 64-byte layout. In it, and in DFD
+  0.54-1.00, protocol 5's Reserved2 (byte 44) is "Record count".
 """
 
 import struct
@@ -32,7 +47,7 @@ import numpy as np
 from .fields import Section
 
 __all__ = [
-    "DRF", "DRF_SIZE", "SYNC_PATTERN", "SYNC_BYTES", "CHECKSUM_SIZE",
+    "DRF", "DRF_SIZE", "DRF_V2", "LEGACY_FRAMES", "SYNC_PATTERN", "SYNC_BYTES", "CHECKSUM_SIZE",
     "FLAG_CHECKSUM_VALID", "FLAG_RECORDED_DATA",
     "checksum", "time7k_to_epoch", "epoch_to_time7k",
     "S7KError", "S7KFormatError", "S7KChecksumError",
@@ -72,6 +87,38 @@ DRF = Section([
     ("FragmentNumber", "u32"),
 ])
 assert DRF.size == DRF_SIZE
+
+# Protocol version 2 Data Record Frame (DFD 0.42, section 5). Verified on
+# 2003 SeaBat 8111-era snapshot files: Offset 68, DataSet counting pairs of
+# records, RecordCount running from 0, both record pointers -1, Flags 0.
+DRF_V2 = Section([
+    ("ProtocolVersion", "u16"),
+    ("Offset", "u16"),
+    ("SyncPattern", "u32"),
+    ("Size", "u32"),
+    ("OptionalDataOffset", "u32"),
+    ("OptionalDataIdentifier", "u32"),
+    ("Year", "u16"),
+    ("Day", "u16"),
+    ("Seconds", "f32"),
+    ("Hours", "u8"),
+    ("Minutes", "u8"),
+    ("Reserved1", "u16"),
+    ("RecordTypeIdentifier", "u32"),
+    ("DeviceIdentifier", "u32"),
+    ("SubsystemIdentifier", "u16"),
+    ("SystemEnumerator", "u16"),
+    ("DataSet", "u32"),
+    ("RecordCount", "u32"),
+    ("PreviousRecord", "i64"),
+    ("NextRecord", "i64"),
+    ("Flags", "u16"),
+    ("Reserved2", "u16"),
+])
+assert DRF_V2.size == 72
+
+# Frames for protocol versions other than 5, by version.
+LEGACY_FRAMES = {2: DRF_V2}
 
 # Byte offsets of DRF fields, for vectorized gathers over a whole file.
 DRF_OFFSETS = {}

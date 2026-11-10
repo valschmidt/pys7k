@@ -282,8 +282,8 @@ it back byte for byte, and points out these cases:
   layout from the record itself: the 44-byte 7041 header of DFD
   2.20-2.31 (7kCenter 5.2), and shorter 7002, 7610 and 1003 records that
   end where the older DFDs ended them.
-* Protocol version 2 files (2003) predate DFD 3.10. Their record bodies
-  are kept raw.
+* Protocol version 2 files (2003) predate DFD 3.10. They are decoded with
+  the 72-byte frame and the 1003/1004 layouts of DFD 0.42.
 * 2010 files store 7048 beam by beam with zero padding, and pad 7012 with
   stale samples. No DFD describes either; both are detected and kept.
 

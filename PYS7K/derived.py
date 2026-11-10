@@ -83,7 +83,7 @@ def gather_header(S, record_type):
         ``Record`` (the index row). Empty if there are no such records.
     """
     idx = _index(S)
-    # Records older than protocol 5 have other layouts.
+    # Records older than protocol 5 have other layouts (records.legacy).
     rows = idx[(idx.RecordType == record_type) & (idx.ProtocolVersion >= MIN_DECODED_PROTOCOL)]
     codec = RECORD_CODECS[record_type]
     section = codec.rth

@@ -355,3 +355,40 @@ def test_protocol_2_frame_in_64_bytes_kept_raw(tmp_path, capsys):
         S.print_records()
     text = capsys.readouterr().out
     assert "predates DFD 3.10" in text and "not a checksum flag" in text
+
+
+def _protocol2_record(rt, body, count):
+    """A protocol 2 record (DFD 0.42 frame) as stored in 2003 files."""
+    from PYS7K.frame import DRF_V2
+    frame = DRF_V2.new()
+    frame.update(ProtocolVersion=2, Offset=68, SyncPattern=0xFFFF, Size=72 + len(body) + 4,
+                 Year=2003, Day=181, Hours=15, Minutes=11, Seconds=26.5,
+                 RecordTypeIdentifier=rt, DeviceIdentifier=31, DataSet=count // 2,
+                 RecordCount=count, PreviousRecord=-1, NextRecord=-1)
+    return DRF_V2.pack(frame) + body + bytes(4)
+
+
+def test_protocol_2_records_decoded(tmp_path, capsys):
+    """Protocol 2 records decode with the DFD 0.42 frame and the 1003/1004
+    layouts of that DFD, and write back byte for byte."""
+    import struct
+    att = struct.pack("<BBHf3f", 0b1011, 205, 3, 0.0, 0.0084, 0.0079, 0.02)
+    pos = struct.pack("<Iddd", 0, 0.38685, -2.78910, 39.6)
+    data = _protocol2_record(1004, att, 0) + _protocol2_record(1003, pos, 1)
+    path = tmp_path / "p2.s7k"
+    path.write_bytes(data)
+    with s7k(str(path)) as S:
+        S.index_file(verify_checksums=True)
+        assert S.Index.ChecksumValid.isna().all()
+        recs = list(S.iter_records())
+        assert b"".join(encode_record(r) for r in recs) == data
+        a, p = recs
+        assert a["Frame"]["RecordCount"] == 0 and a["Frame"]["PreviousRecord"] == -1
+        assert a["RTH"]["N"] == 3 and set(a["RD"]) == {"Pitch", "Roll", "Heave"}
+        assert a["RD"]["Heave"][0] == pytest.approx(0.02)
+        assert p["Frame"]["RecordCount"] == 1 and p["RTH"]["Height"] == pytest.approx(39.6)
+        S.print_records()
+        S.report_record_types()
+    text = capsys.readouterr().out
+    assert "decoded with the layouts of its own DFD" in text and "no checksum flagged" in text
+    assert "RD.Heave" in text and "raw" not in text.split("RecordType")[-1]

@@ -11,15 +11,16 @@ import struct
 import numpy as np
 
 from .frame import (CHECKSUM_SIZE, DRF, DRF_SIZE, FLAG_CHECKSUM_VALID,
-                    S7KFormatError, checksum)
+                    LEGACY_FRAMES, S7KFormatError, checksum)
 from .optional_data import OPTIONAL_DATA_CODECS
 from .records import ALL_CODECS
 from .records.base import new_record
+from .records.legacy import CODECS as LEGACY_CODECS
 
 __all__ = [
     "RECORD_CODECS", "RECORD_TYPE_DESCRIPTIONS", "DEVICE_IDENTIFIERS",
     "PING_RECORD_TYPES", "record_name", "new", "decode_record", "encode_record",
-    "detect_checksum_trailer", "MIN_DECODED_PROTOCOL",
+    "detect_checksum_trailer", "MIN_DECODED_PROTOCOL", "LEGACY_CODECS",
 ]
 
 RECORD_CODECS = {c.record_type: c for c in ALL_CODECS}
@@ -107,7 +108,9 @@ _U32 = struct.Struct("<I")
 
 # Record bodies, optional data and the Flags checksum bit are interpreted
 # with DFD 3.10 layouts for this protocol version and later (DFD 3.10 is
-# protocol 5). Bodies of records with an older protocol are kept raw.
+# protocol 5). Older protocols use frame.LEGACY_FRAMES and LEGACY_CODECS
+# (keyed by (protocol, record type)) where those are known, and are
+# otherwise kept raw.
 MIN_DECODED_PROTOCOL = 5
 
 
@@ -169,16 +172,26 @@ def decode_record(data, offset=0, checksum_trailer=True):
             "Error": "inconsistent frame offsets (Offset=%d, OptionalDataOffset=%d, Size=%d)"
                      % (frame["Offset"], odo, size),
         }
-    # DFD 3.10 describes protocol version 5. Older protocols have other
-    # layouts, so their bodies are kept raw.
+    # DFD 3.10 describes protocol version 5. Older protocols have their
+    # own frame (frame.LEGACY_FRAMES) and record layouts (LEGACY_CODECS);
+    # bodies with no known layout for their protocol are kept raw.
     pv = frame["ProtocolVersion"]
     modern = pv >= MIN_DECODED_PROTOCOL
-    codec = RECORD_CODECS.get(rt) if modern else None
+    frame_size = DRF_SIZE
+    if not modern and pv in LEGACY_FRAMES and rth_start >= LEGACY_FRAMES[pv].size:
+        frame = LEGACY_FRAMES[pv].unpack(mv, offset)
+        frame_size = LEGACY_FRAMES[pv].size
+    if modern:
+        codec = RECORD_CODECS.get(rt)
+    else:   # legacy layouts only inside a legacy frame
+        codec = LEGACY_CODECS.get((pv, rt)) if frame_size != DRF_SIZE else None
     rec = new_record(rt, codec)
     if not modern:
-        rec["Note"] = "protocol version %d predates DFD 3.10 (protocol 5); the body is kept raw" % pv
+        rec["Note"] = "protocol version %d predates DFD 3.10 (protocol 5); %s" % (
+            pv, "decoded with the layouts of its own DFD" if codec is not None
+            else "the body is kept raw")
     rec["Frame"] = frame
-    rec["Unparsed"]["Frame"] = bytes(rec_mv[DRF_SIZE:rth_start])
+    rec["Unparsed"]["Frame"] = bytes(rec_mv[frame_size:rth_start])
     body = rec_mv[rth_start:body_end]
     used = 0
     if codec is not None:
@@ -236,6 +249,10 @@ def encode_record(record, checksum_mode="auto"):
     pv = record["Frame"]["ProtocolVersion"]
     modern = pv >= MIN_DECODED_PROTOCOL
     codec = RECORD_CODECS.get(rt) if modern else None
+    frame_section = DRF
+    if not modern and pv in LEGACY_FRAMES and all(k in record["Frame"] for k in LEGACY_FRAMES[pv].names):
+        frame_section = LEGACY_FRAMES[pv]
+        codec = LEGACY_CODECS.get((pv, rt))
     unparsed = record.get("Unparsed") or {}
     frame_extra = bytes(unparsed.get("Frame", b""))
     body = (codec.encode(record) if codec is not None else b"") + bytes(unparsed.get("Body", b""))
@@ -246,14 +263,14 @@ def encode_record(record, checksum_mode="auto"):
             od = od_codec.encode(record["OptionalData"])
         od += bytes(unparsed.get("OptionalData", b""))
     frame = dict(record["Frame"])
-    head = DRF_SIZE + len(frame_extra)
+    head = frame_section.size + len(frame_extra)
     frame["Offset"] = head - 4
     frame["RecordTypeIdentifier"] = rt
     frame["OptionalDataOffset"] = head + len(body) if record.get("OptionalData") is not None else 0
     flagged = frame["ProtocolVersion"] >= MIN_DECODED_PROTOCOL and frame["Flags"] & FLAG_CHECKSUM_VALID
     no_trailer = record.get("Checksum", 0) is None and checksum_mode != "recompute" and not flagged
     frame["Size"] = head + len(body) + len(od) + (0 if no_trailer else CHECKSUM_SIZE)
-    out = DRF.pack(frame) + frame_extra + body + od
+    out = frame_section.pack(frame) + frame_extra + body + od
     if no_trailer:
         return out
     if checksum_mode == "recompute" or (checksum_mode == "auto" and flagged

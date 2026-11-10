@@ -32,7 +32,8 @@ Writers and systems seen:
   uninitialized memory.
 * Fledermaus navigation exports (1003/1008 only, no checksum trailers).
 * Protocol version 2 snapshot files from 2003. These predate DFD 3.10 and
-  have other layouts, so their record bodies are kept raw.
+  are decoded with the frame and 1003/1004 layouts of DFD 0.42
+  (``frame.DRF_V2``, ``records.legacy``).
 
 Writer quirks found, and how pys7k handles them (each is also noted where
 the code deals with it):

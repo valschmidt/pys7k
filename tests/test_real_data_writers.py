@@ -139,6 +139,23 @@ def test_fledermaus_records_without_checksum_field():
         assert np.allclose(nav["Latitude"], 27.0, atol=0.1) and np.allclose(nav["Longitude"], -90.6, atol=0.1)
 
 
+def test_protocol_2_decoded_with_dfd_042():
+    """2003 files: DFD 0.42 frame (RecordCount running from 0, pointers -1)
+    and 1003/1004 layouts; positions off Kauai."""
+    import math
+    with open_file("protocol2_2003.s7k") as S:
+        assert (S.Index.ProtocolVersion == 2).all() and S.Index.ChecksumValid.isna().all()
+        for rec in S.iter_records():
+            f = rec["Frame"]
+            assert f["Offset"] == 68 and f["PreviousRecord"] == f["NextRecord"] == -1
+            assert rec["RTH"] and not rec["Unparsed"]["Body"]
+            if rec["RecordType"] == 1003:
+                assert math.degrees(rec["RTH"]["Latitude"]) == pytest.approx(22.165, abs=0.01)
+                assert math.degrees(rec["RTH"]["Longitude"]) == pytest.approx(-159.804, abs=0.01)
+            else:
+                assert len(rec["RD"]) in (1, 3)
+
+
 def test_norbit_stx_7042_lines_up_with_7027():
     with open_file("norbit_stx_2024_7042.s7k") as S:
         det = D.read_detections(S)

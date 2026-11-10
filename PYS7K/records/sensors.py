@@ -6,8 +6,9 @@ angles in radians, distances in meters.
 
 Verified against real data (see ``PYS7K.verification``): 1003, 1008, 1010,
 1012, 1013, 1015 and 1016, from Reson 7k, Teledyne PDS, HYPACK, NORBIT and
-Fledermaus writers. Tested with synthetic records only: 1000-1002, 1004,
-1005-1007, 1009, 1011, 1014, 1017, 1020, 2004 and 3001.
+Fledermaus writers. Tested with synthetic records only: 1000-1002, 1004
+(the 2003 protocol-2 1003 and 1004 records use DFD 0.42 layouts, decoded
+by ``records.legacy``), 1005-1007, 1009, 1011, 1014, 1017, 1020, 2004 and 3001.
 """
 
 from ..fields import Section, Table
