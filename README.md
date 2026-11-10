@@ -23,7 +23,9 @@ pip install pys7k
 ## Command line
 
 `s7k.py -f FILE -V` indexes a file and prints a table of its record types.
-Add `-c` to verify every record's checksum.
+"Decoded" says whether a type is decoded field by field, and "Real Data"
+whether its decoder has been checked against real files. Add `-c` to
+verify every record's checksum.
 
 ```
 $ s7k.py -f uam_7125_7027_7028_nav.s7k -V -c
@@ -34,13 +36,13 @@ Protocol version(s): 5
 Devices: 0/0 (Unspecified, 1 records), 7000/0 (7k sonar source, 4 records), 7003/0 (Teledyne PDS, 25 records), 7125/0 (SeaBat 7125, 35 records)
 Time span: 2012-11-28T19:09:22.014999+00:00 to 2012-11-28T19:35:56.467998+00:00 (1594.5 s)
 
-                                     Name  Count  Total Bytes  Min Bytes  Max Bytes  % of File Decoded  Checksum OK  Checksum Bad  No Checksum
+                                     Name  Count  Total Bytes  Min Bytes  Max Bytes  % of File Decoded Real Data  Checksum OK  Checksum Bad  No Checksum
 RecordType
-7028                         Snippet Data      5       113078      22598      22642      31.75     yes            5             0            0
-7017                 Detection Data Setup      5        87858      17558      17592      24.67     yes            5             0            0
-7027                   Raw Detection Data      5        57089      11409      11431      16.03     yes            5             0            0
+7028                         Snippet Data      5       113078      22598      22642      31.75     yes       yes            5             0            0
+7017                 Detection Data Setup      5        87858      17558      17592      24.67     yes       yes            5             0            0
+7027                   Raw Detection Data      5        57089      11409      11431      16.03     yes       yes            5             0            0
 ...
-7777                 Filler (file repair)      1          390        390        390       0.11     raw            0             0            1
+7777                 Filler (file repair)      1          390        390        390       0.11     raw                      0             0            1
 ```
 
 `s7k.py -f FILE -p [RECORDTYPE]` prints records as text for debugging. The
@@ -133,7 +135,8 @@ rec = next(S.iter_records(7027))
 
 ```
 {'RecordType': 'int', 'Frame': 'dict', 'RTH': 'dict', 'RD': 'dict',
- 'OptionalData': 'NoneType', 'Unparsed': 'dict', 'Checksum': 'int'}
+ 'OptionalData': 'NoneType', 'Unparsed': 'dict', 'Checksum': 'int',
+ 'ChecksumValid': 'bool'}
 ```
 
 * `rec["Frame"]` holds every field of the 64-byte Data Record Frame.
@@ -143,6 +146,8 @@ rec = next(S.iter_records(7027))
 * `rec["OptionalData"]` holds the optional data (DFD Appendix A), or `None`.
 * `rec["Unparsed"]` holds any bytes past the known layout. For record types
   with no decoder, `rec["Unparsed"]["Body"]` holds the whole body.
+* `rec["Checksum"]` is the stored checksum, and `rec["ChecksumValid"]`
+  whether it verifies (None when Flags bit 0 says there is no checksum).
 
 Field sets follow the sizes the record declares. This 2012 file writes
 22-byte 7027 detections, so `Intensity`, `MinLimit` and `MaxLimit` are
@@ -213,8 +218,10 @@ out.closeFile(catalog=True)
 `new(record_type)` returns a template record with every field set to zero.
 Fill it in and pass it to `write_record`. The encoder recomputes the
 frame's Size and offsets. The checksum is computed when Flags bit 0 is set
-and written as stored otherwise, so unmodified records come back byte for
-byte. `closeFile(catalog=True)` appends a 7300 file catalog and points the
+and written as stored otherwise. A record read with a checksum that did not
+verify keeps its stored checksum, so unmodified records always come back
+byte for byte. Use `write_record(rec, "recompute")` to repair a checksum.
+`closeFile(catalog=True)` appends a 7300 file catalog and points the
 7200 file header at it.
 
 ## Kluster
@@ -229,32 +236,77 @@ TxAngle to degrees like every other angle.
 
 ## Notes on the DFD
 
-pys7k is experimental. Its interfaces may change between releases. Only
-7125 data has been tested so far. Many record layouts were transcribed
-from the DFD and have only been tested with synthetic records, because no
-sample files contain them. Please check results against other tools
-before relying on them, and report any discrepancies.
+pys7k is experimental. Its interfaces may change between releases. Please
+check results against other tools before relying on them, and report any
+discrepancies.
 
-These points were checked against 7125 data from 2012 and 2016.
+The decoders have been checked against real files from SeaBat 7101, 7111,
+7125, T20-P and T50-R sonars, NORBIT WBMS and STX sonars, and files written
+by Reson RDR 1.2 and 2.0, 7kCenter 3.7 to 6.3, Teledyne PDS 2.3 to 3.9,
+HYPACK and Fledermaus, dated 2005 to 2024. `PYS7K/verification.py` lists
+the evidence for each record type, and the "Real Data" column of
+`s7k.py -V` shows whether a file's record types have been checked this way.
+Record types without real samples (most phase 3 records, the SBES records,
+7047 and others) have been tested with synthetic records
+only.
+
+These points were checked against real data.
 
 * The checksum flag is Flags bit 0. The DFD's checksum row says bit 1,
-  which is a typo.
-* The 7200, 7300, 7777 and 7038 records carry no checksum, and neither do
-  7008 records written by HYPACK.
+  a leftover from the protocol 2 and 3 frames (DFD 0.42, 0.50), which did
+  use bit 1. DFD 0.53 moved the flag to bit 0.
+* The 7200, 7300, 7777 and 7038 records carry no checksum. Neither do 7008
+  (Reson recorders and HYPACK), 7011, 7018 or 7058 records, nor any NORBIT
+  record.
 * The 7503 record has no ReceiveBeamWidth field. Its full 3.10 layout is
   260 bytes.
-* 7k logger files leave the 7200 pointer to the 7300 catalog at zero.
+* 7k logger files leave the 7200 pointer to the 7300 catalog at zero, and
+  RDR 1.2 writes only 6 bytes of 7200 optional data.
+* 7027 detections are 22, 26 or 34 bytes, depending on the writer: the
+  DFD 2.20-2.22, 2.31-2.41 and 3.x forms.
+
+Writers do not always follow the DFD. pys7k reports what is stored, writes
+it back byte for byte, and points out these cases:
+
+* Wrong stored checksums. Records keep their stored checksum on writing
+  (`rec["ChecksumValid"]` is False), and `s7k.py -p` recognizes HYPACK's
+  habit of storing Size - 4, and PDS 7610 checksums computed before the
+  frame's Reserved4 field was filled in.
+* Fledermaus navigation files have no checksum field at all. This is
+  detected per file (`S.ChecksumTrailer`).
+* Teledyne PDS 7028 records place their optional data before the offset
+  the frame gives. `optional_data.recover_misplaced_optional_data` reads it.
+* A 2011 file stores attitude in degrees, not radians.
+  `derived.read_attitude` warns about values that cannot be radians.
+* Some records follow an older DFD rather than 3.10. pys7k picks the
+  layout from the record itself: the 44-byte 7041 header of DFD
+  2.20-2.31 (7kCenter 5.2), and shorter 7002, 7610 and 1003 records that
+  end where the older DFDs ended them.
+* Protocol version 2 files (2003) predate DFD 3.10. Their record bodies
+  are kept raw.
+* 2010 files store 7048 beam by beam with zero padding, and pad 7012 with
+  stale samples. No DFD describes either; both are detected and kept.
+
+The older DFDs used for this are archived with MB-System
+(<https://www.mbari.org/technology/mb-system/documentation/data-format-specifications/>).
+`PYS7K/verification.py` lists what they explained and what they did not
+(7026, 7777, 6-byte 7200 optional data, the PDS 7028 placement).
 
 ## Tests
 
 ```
 python scripts/make_test_subsets.py --defaults   # optional: cut real-data test files into data/
+python scripts/make_test_subsets.py --writers --root DIR  # optional: writer samples into data/writers/
 pytest
 ```
 
 Most tests build synthetic records with the writer and always run. Tests
 on real data use the small files in `data/` and are skipped when that
-folder is empty.
+folder is empty. `make_test_subsets.py --writers` also copies samples of
+files from many writers and systems, named in a local list
+(`data/writer_samples.json`, not in the repository), into `data/writers/`,
+record for record, so their quirks are kept;
+`tests/test_real_data_writers.py` checks each one.
 
 ## License
 

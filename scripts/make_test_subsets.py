@@ -9,13 +9,27 @@ types given with --also are copied from anywhere in the file (for example the
 is dropped, and a new 7300 catalog is written for the subset, with the 7200
 file header's optional-data pointer set to it.
 
+With --writers, small type-sampled copies of the files named in a local
+sample list (default data/writer_samples.json, not part of the repository)
+are written to data/writers/ instead: the first few records of every
+record type, copied unchanged (no catalog is added, so writer quirks such
+as bad checksums or missing checksum fields are preserved). These cover the
+writers and systems listed in PYS7K/verification.py. Paths in the list are
+relative to --root; missing files are skipped. The list is a JSON array of
+objects with keys "path", "name" (file written to data/writers/),
+"per_type" (records kept per type), "max_records" (frames walked at most)
+and optionally "skip" (record types to leave out).
+
 Usage:
     python scripts/make_test_subsets.py SOURCE DEST --pings 5 [--also 7777]
     python scripts/make_test_subsets.py --defaults     # the repository's test files
+    python scripts/make_test_subsets.py --writers --root DIR   # writer samples into data/writers/
 """
 
 import argparse
+import json
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -37,6 +51,39 @@ DEFAULTS = [
     ("/Users/vschmidt/Projects/UAM/7125_IQ/20121128_194708.s7k",
      "uam_7125_7038_iq.s7k", 2, [7777], 7038),
 ]
+
+
+WRITER_SAMPLES = os.path.join(DATA_DIR, "writer_samples.json")
+
+_FRAME_HEAD = struct.Struct("<HHII")
+
+
+def cut_by_type(source, dest, per_type, max_records, skip=()):
+    """
+    Copy the first ``per_type`` records of each record type (except 7300
+    and the types in ``skip``) from ``source`` to ``dest`` unchanged, walking at most ``max_records``
+    frames. Frames are read with seeks, so a file on a network drive is
+    not read in full. Returns the number of records written.
+    """
+    size = os.path.getsize(source)
+    counts, written, pos, n = {}, 0, 0, 0
+    with open(source, "rb") as f, open(dest, "wb") as out:
+        while pos + 68 <= size and n < max_records:
+            f.seek(pos)
+            head = f.read(20)
+            _, _, sync, rec_size = _FRAME_HEAD.unpack_from(head)
+            if sync != 0xFFFF or rec_size < 68 or pos + rec_size > size:
+                break
+            f.seek(pos + 32)
+            rt = struct.unpack("<I", f.read(4))[0]
+            if rt != 7300 and rt not in skip and counts.get(rt, 0) < per_type:
+                f.seek(pos)
+                out.write(f.read(rec_size))
+                written += 1
+            counts[rt] = counts.get(rt, 0) + 1
+            pos += rec_size
+            n += 1
+    return written
 
 
 def cut(source, dest, pings, also=(), start_type=None):
@@ -86,8 +133,26 @@ def main(argv=None):
     p.add_argument("--start-type", type=int, default=None,
                    help="start at the first ping having a record of this type")
     p.add_argument("--defaults", action="store_true", help="write the standard test subsets to data/")
+    p.add_argument("--writers", action="store_true", help="write the writer-quirk samples to data/writers/")
+    p.add_argument("--writers-list", default=WRITER_SAMPLES, help="JSON sample list (default %(default)s)")
+    p.add_argument("--root", default=".", help="directory the sample list's paths are relative to")
     args = p.parse_args(argv)
     jobs = []
+    if args.writers:
+        with open(args.writers_list) as f:
+            samples = json.load(f)
+        out_dir = os.path.join(DATA_DIR, "writers")
+        os.makedirs(out_dir, exist_ok=True)
+        for sample in samples:
+            source = os.path.join(args.root, sample["path"])
+            if not os.path.exists(source):
+                print("skipping (not found): %s" % source)
+                continue
+            dest = os.path.join(out_dir, sample["name"])
+            count = cut_by_type(source, dest, sample["per_type"], sample["max_records"],
+                                tuple(sample.get("skip", ())))
+            print("%s: %d records, %d bytes" % (dest, count, os.path.getsize(dest)))
+        return
     if args.defaults:
         os.makedirs(DATA_DIR, exist_ok=True)
         jobs = [(job[0], os.path.join(DATA_DIR, job[1])) + tuple(job[2:]) for job in DEFAULTS]
