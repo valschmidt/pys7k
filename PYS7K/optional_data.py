@@ -14,7 +14,7 @@ stored.
 
 from .fields import Section, Table
 
-__all__ = ["OptionalDataCodec", "OPTIONAL_DATA_CODECS"]
+__all__ = ["OptionalDataCodec", "OPTIONAL_DATA_CODECS", "recover_misplaced_optional_data"]
 
 
 class OptionalDataCodec:
@@ -82,7 +82,10 @@ OPTIONAL_DATA_CODECS = {
     7047: OptionalDataCodec(_PDS_BATHY_HEADER, _PDS_BATHY_BEAMS),      # Table 222
     7057: OptionalDataCodec(_PDS_POSITION + [("Depth", "f32")]),       # Table 223
     7058: OptionalDataCodec(_PDS_POSITION, _PDS_WC_BEAMS),             # Table 224
-    7200: OptionalDataCodec([("Size", "u32"), ("Offset", "u64")]),     # Table 105
+    # Table 105. Reson's RDR 1.2 recorder (7125 files from 2006-2011) writes
+    # only 6 bytes of zeros here: Size decodes, Offset is None, and the
+    # remaining 2 bytes are kept in Unparsed["OptionalData"].
+    7200: OptionalDataCodec([("Size", "u32"), ("Offset", "u64")]),
     7400: OptionalDataCodec([                                          # Table 225
         ("UTCTime", "f64"),
         ("ExternalTime", "f64"),
@@ -93,3 +96,48 @@ OPTIONAL_DATA_CODECS = {
         ("IOModuleStatus", "u16"),
     ]),
 }
+
+
+def recover_misplaced_optional_data(record):
+    """
+    Decode 7028 optional data that was written before the place the frame's
+    OptionalDataOffset points to.
+
+    Teledyne PDS2000 (3.9.1.3, 3.9.2.0 and 3.9.2.2 seen, in 2014 7125 and
+    T20-P files) writes 7028 records with u16 snippets (Flags bit 0 clear)
+    but sizes the record, and sets OptionalDataOffset, as if the snippets
+    were u32. The real optional data follows the u16 snippets, inside what
+    the frame says is record data. The region the frame calls optional data
+    holds zeros or stale bytes from an earlier record. pys7k decodes such a
+    record as stored: ``OptionalData`` is whatever the declared region
+    holds, and ``Unparsed["Body"]``, which is exactly as long as the
+    snippets, starts with the real optional data. When the snippets are
+    shorter than the optional data, the rest of it is at the start of the
+    declared region.
+
+    This function returns the optional data decoded from the start of
+    ``Unparsed["Body"]`` (continuing into the declared region if needed)
+    when the record shows that signature (a 7028 with
+    Flags bit 0 clear, optional data present, and unparsed body bytes equal
+    in length to the snippets), or None otherwise. The beam count is the
+    record header's ``N``. The record itself is not changed.
+    """
+    if record.get("RecordType") != 7028 or "RTH" not in record:
+        return None
+    codec = OPTIONAL_DATA_CODECS[7028]
+    extra = bytes((record.get("Unparsed") or {}).get("Body", b""))
+    samples = (record.get("RD") or {}).get("Samples")
+    rth = record["RTH"]
+    if record.get("OptionalData") is None or samples is None or rth.get("Flags", 0) & 1:
+        return None
+    if not extra or len(extra) != len(samples) * 2:
+        return None
+    size = codec.header.size + codec.beams.itemsize * (rth.get("N") or 0)
+    # The real optional data starts the unparsed body; when the snippets are
+    # shorter than it, it runs on into the declared optional data region.
+    declared = codec.encode(record["OptionalData"]) + bytes(record["Unparsed"].get("OptionalData", b""))
+    buf = extra + declared
+    if len(buf) < size:
+        return None
+    d, _ = codec.decode(memoryview(buf)[:size])
+    return d

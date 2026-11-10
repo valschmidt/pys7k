@@ -108,3 +108,18 @@ class TestFrame:
 
     def test_leap_year_day(self):
         assert time7k_to_epoch(2016, 366, 0, 0, 0) == 1483142400.0   # 2016-12-31
+
+
+def test_signaling_nan_round_trips():
+    """A signaling NaN becomes quiet as a Python float; Section keeps the
+    stored bits (seen in Teledyne PDS 7028 optional data, 2014)."""
+    import struct
+    from PYS7K.fields import RawNaN, Section
+    sec = Section([("A", "f32"), ("B", "f64"), ("C", "f32*2"), ("D", "u16")])
+    raw = (bytes.fromhex("9cbe86ff") + struct.pack("<d", 1.5) + bytes.fromhex("0100807f") +
+           struct.pack("<f", 2.0) + struct.pack("<H", 7))
+    d = sec.unpack(raw)
+    assert isinstance(d["A"], RawNaN) and d["A"] != d["A"]
+    assert sec.pack(d) == raw
+    d2, used = sec.unpack_prefix(raw[:4], 0, 4)
+    assert sec.pack(d2) == raw[:4] and used == 4

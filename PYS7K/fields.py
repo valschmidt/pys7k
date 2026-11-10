@@ -34,7 +34,7 @@ import struct
 
 import numpy as np
 
-__all__ = ["Section", "Table", "parse_code"]
+__all__ = ["Section", "Table", "parse_code", "RawNaN"]
 
 _STRUCT_CODES = {
     "u8": "B", "u16": "H", "u32": "I", "u64": "Q",
@@ -76,6 +76,28 @@ def parse_code(code):
     return "%d%s" % (n, fmt), "tuple", n, size * n
 
 
+class RawNaN(float):
+    """
+    A NaN float field that remembers its stored bit pattern.
+
+    Converting a stored f32/f64 to a Python float turns a signaling NaN into
+    a quiet one (and an f32 NaN payload can change), so writing it back
+    would change a byte. Seen in the optional data of Teledyne PDS 7028
+    records (2014). ``Section`` decodes NaN fields as ``RawNaN`` and
+    encodes them from ``raw``, so they round-trip byte for byte. A RawNaN
+    behaves as an ordinary NaN float otherwise.
+    """
+
+    def __new__(cls, raw):
+        value = struct.unpack("<f" if len(raw) == 4 else "<d", raw)[0]
+        obj = float.__new__(cls, value)
+        obj.raw = bytes(raw)
+        return obj
+
+    def __repr__(self):
+        return "nan"
+
+
 def _default(kind, code, nbytes, count):
     if kind == "bytes":
         return b"\x00" * nbytes
@@ -113,6 +135,19 @@ class Section:
         self.size = self.struct.size
         self._simple = all(k != "tuple" for k in self._kinds)
         self._prefix_structs = {len(self.fields): self.struct}
+        # Byte offset and width of each float in the flat struct values,
+        # for keeping NaN bit patterns (see RawNaN).
+        self._float_slots = []
+        flat_i = 0
+        start = 0
+        for fmt, kind, count, end in zip(self._fmts, self._kinds, self._counts, self._ends):
+            base = fmt[-1]
+            if base in "fd":
+                width = 4 if base == "f" else 8
+                for j in range(count):
+                    self._float_slots.append((flat_i + j, start + j * width, width))
+            flat_i += count
+            start = end
 
     def new(self):
         """Return a template dictionary with every field set to zero."""
@@ -140,9 +175,21 @@ class Section:
             pos += count
         return out
 
+    def _keep_nans(self, values, buf, offset, nvalues):
+        if not self._float_slots:
+            return values
+        nan_slots = [(i, o, w) for i, o, w in self._float_slots if i < nvalues and values[i] != values[i]]
+        if not nan_slots:
+            return values
+        values = list(values)
+        for i, o, w in nan_slots:
+            values[i] = RawNaN(bytes(buf[offset + o:offset + o + w]))
+        return values
+
     def unpack(self, buf, offset=0):
         """Decode the full section from ``buf`` at ``offset``."""
-        return self._group(self.struct.unpack_from(buf, offset), len(self.fields))
+        values = self.struct.unpack_from(buf, offset)
+        return self._group(self._keep_nans(values, buf, offset, len(values)), len(self.fields))
 
     def unpack_prefix(self, buf, offset=0, available=None):
         """
@@ -158,7 +205,10 @@ class Section:
         nfields = 0
         while nfields < len(self._ends) and self._ends[nfields] <= available:
             nfields += 1
-        out = self._group(self._prefix_struct(nfields).unpack_from(buf, offset), nfields) if nfields else {}
+        out = {}
+        if nfields:
+            values = self._prefix_struct(nfields).unpack_from(buf, offset)
+            out = self._group(self._keep_nans(values, buf, offset, len(values)), nfields)
         for name in self.names[nfields:]:
             out[name] = None
         return out, (self._ends[nfields - 1] if nfields else 0)
@@ -182,7 +232,15 @@ class Section:
             else:
                 flat.append(v)
             nfields += 1
-        return self._prefix_struct(nfields).pack(*flat)
+        data = self._prefix_struct(nfields).pack(*flat)
+        raw = [(o, flat[i].raw) for i, o, w in self._float_slots
+               if i < len(flat) and isinstance(flat[i], RawNaN) and len(flat[i].raw) == w]
+        if raw:
+            data = bytearray(data)
+            for o, b in raw:
+                data[o:o + len(b)] = b
+            data = bytes(data)
+        return data
 
     def __len__(self):
         return self.size

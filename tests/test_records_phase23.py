@@ -232,3 +232,119 @@ def test_every_documented_type_has_codec():
                   1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1020, 2004, 3001, 10000, 10003,
                   10004, 10018, 10027, 10049, 10060, 10061, 10062]
     assert [rt for rt in documented if rt not in RECORD_CODECS] == []
+
+
+def test_7009_vertical_depth():
+    rec = new(7009)
+    rec["RTH"].update(Frequency=396000.0, PingNumber=385268, Latitude=0.8788, VerticalDepth=29.74)
+    data, out = round_trip(rec)
+    assert len(data) == 64 + 42 + 4
+    assert out["RTH"]["PingNumber"] == 385268
+
+
+def test_7028_pds2000_misplaced_optional_data():
+    """PDS2000 writes u16 snippets but sizes the record (and places the
+    optional data offset) as if they were u32 (see
+    recover_misplaced_optional_data)."""
+    import struct
+    from PYS7K.frame import checksum
+    from PYS7K.optional_data import OPTIONAL_DATA_CODECS, recover_misplaced_optional_data
+    rec = new(7028)
+    rec["RTH"]["N"] = 2
+    rec["RD"]["Beams"] = {"BeamDescriptor": np.array([0, 1], "<u2"), "SnippetStart": np.array([10, 40], "<u4"),
+                          "DetectionSample": np.array([25, 55], "<u4"), "SnippetEnd": np.array([39, 69], "<u4")}
+    rec["RD"]["Samples"] = np.arange(1, 61, dtype="<u2")           # 60 samples, 120 bytes
+    od = OPTIONAL_DATA_CODECS[7028].new()
+    od.update(Frequency=396000.0, Latitude=0.88)
+    od["Beams"] = {"AlongTrackDistance": np.ones(2, "<f4"), "AcrossTrackDistance": np.ones(2, "<f4"),
+                   "CenterSampleNumber": np.array([25, 55], "<u4")}
+    good = encode_record(rec)                          # no optional data
+    od_bytes = OPTIONAL_DATA_CODECS[7028].encode(od)
+    extra = od_bytes + bytes(120 - len(od_bytes))      # as long as the u16 snippets
+    stale = b"\x5a" * len(od_bytes)                    # declared optional data region
+    body = bytearray(good[:-4]) + extra + stale
+    struct.pack_into("<I", body, 8, len(body) + 4)                     # Size
+    struct.pack_into("<I", body, 12, len(good) - 4 + len(extra))       # OptionalDataOffset
+    struct.pack_into("<I", body, 16, 7028)
+    data = bytes(body) + struct.pack("<I", checksum(body))
+    out = decode_record(bytearray(data))
+    assert encode_record(out) == data
+    assert len(out["Unparsed"]["Body"]) == 120
+    got = recover_misplaced_optional_data(out)
+    assert got["Frequency"] == 396000.0 and list(got["Beams"]["CenterSampleNumber"]) == [25, 55]
+    assert recover_misplaced_optional_data(decode_record(bytearray(good))) is None
+
+
+def test_7028_pds2000_optional_data_spills_into_declared_region():
+    """When the u16 snippets are shorter than the optional data, PDS's real
+    optional data runs on past the unparsed body into the declared region."""
+    import struct
+    from PYS7K.frame import checksum
+    from PYS7K.optional_data import OPTIONAL_DATA_CODECS, recover_misplaced_optional_data
+    codec = OPTIONAL_DATA_CODECS[7028]
+    rec = new(7028)
+    rec["RTH"]["N"] = 2
+    rec["RD"]["Beams"] = {"BeamDescriptor": np.array([0, 1], "<u2"), "SnippetStart": np.array([10, 20], "<u4"),
+                          "DetectionSample": np.array([11, 21], "<u4"), "SnippetEnd": np.array([12, 22], "<u4")}
+    rec["RD"]["Samples"] = np.arange(1, 7, dtype="<u2")            # 12 bytes, less than the 48-byte OD
+    od = codec.new()
+    od.update(Frequency=396000.0, Latitude=0.88, Longitude=-0.07, Heading=1.5)
+    od["Beams"] = {"AlongTrackDistance": np.ones(2, "<f4"), "AcrossTrackDistance": np.ones(2, "<f4"),
+                   "CenterSampleNumber": np.array([11, 21], "<u4")}
+    good = encode_record(rec)
+    od_bytes = codec.encode(od)
+    body = bytearray(good[:-4]) + od_bytes + bytes(12)              # OD, then 12 bytes of padding
+    struct.pack_into("<I", body, 8, len(body) + 4)
+    struct.pack_into("<I", body, 12, len(good) - 4 + 12)            # declared OD 12 bytes too late
+    struct.pack_into("<I", body, 16, 7028)
+    data = bytes(body) + struct.pack("<I", checksum(body))
+    out = decode_record(bytearray(data))
+    assert encode_record(out) == data
+    got = recover_misplaced_optional_data(out)
+    assert got["Heading"] == pytest.approx(1.5) and list(got["Beams"]["CenterSampleNumber"]) == [11, 21]
+
+
+def test_real_data_verified_types_have_codecs():
+    from PYS7K.verification import REAL_DATA_VERIFIED
+    assert [rt for rt in REAL_DATA_VERIFIED if rt not in RECORD_CODECS] == []
+
+
+def test_7041_dfd22_header():
+    """DFD 2.20-2.31 define a 44-byte 7041 header (separate down-sampling,
+    filtering and encoding bytes, u32 Flags); 7kCenter 5.2 writes it."""
+    rec = new(7041)
+    rec["RTH"] = RECORD_CODECS[7041].rth_dfd22.new()
+    rec["RTH"].update(N=3, DownsamplingMethod=1, Flags=0, SampleRate=999.5)
+    rec["RD"] = {"Beams": {"Beam": np.arange(3, dtype="<u2"), "Samples": np.full(3, 4, "<u4")},
+                 "Samples": np.arange(300, 312, dtype="<u2"), "SampleWidth": 2}
+    data, out = round_trip(rec)
+    assert len(data) == 64 + 44 + 3 * (6 + 8) + 4
+    assert out["RTH"]["DownsamplingMethod"] == 1 and out["RTH"]["SampleRate"] == 999.5
+    assert out["RD"]["SampleWidth"] == 2 and out["RD"]["Samples"][-1] == 311
+
+
+def test_7041_dfd22_encodings():
+    """DFD 2.2x Flags bits 0-3 give the sample width (8-bit magnitude here)
+    and bit 4 selects f32 beam angles."""
+    rec = new(7041)
+    rec["RTH"] = RECORD_CODECS[7041].rth_dfd22.new()
+    rec["RTH"].update(N=2, Flags=0x11, SampleRate=1000.0)
+    rec["RD"] = {"Beams": {"Beam": np.array([-0.5, 0.5], "<f4"), "Samples": np.full(2, 3, "<u4")},
+                 "Samples": np.arange(6, dtype="u1"), "SampleWidth": 1}
+    data, out = round_trip(rec)
+    assert out["RD"]["SampleWidth"] == 1 and out["RD"]["Beams"]["Beam"].dtype == np.float32
+
+
+def test_7048_beam_major_with_padding():
+    """2010 7125 files store 7048 beam by beam and end it with N x 14 zero
+    bytes; the decoder recognizes that and keeps the stored order."""
+    rec = new(7048)
+    rec["RTH"].update(N=2, S=3)
+    beams = np.array([[1, 2, 3], [4, 5, 6]], "<f4")         # beam by beam
+    rec["RD"] = {"Intensity": beams.T, "BeamMajor": True}
+    rec["Unparsed"]["Body"] = bytes(2 * 14)
+    data, out = (encode_record(rec), None)
+    out = decode_record(bytearray(data))
+    assert out["RD"]["BeamMajor"] and out["RD"]["Intensity"].shape == (3, 2)
+    assert list(out["RD"]["Intensity"][:, 1]) == [4, 5, 6]
+    assert encode_record(out) == data

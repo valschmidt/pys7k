@@ -66,7 +66,7 @@ import numpy as np
 
 from .bitfields import CONTROL_FLAGS_7000, RECEIVE_FLAGS_7000, decode_bits
 from .derived import decode_text, gather_header, read_svp
-from .registry import RECORD_CODECS, decode_record
+from .registry import RECORD_CODECS
 from .s7k import s7k
 
 __all__ = ["X7kRead", "KLUSTER_DEVICE_IDENTIFIERS", "translate_yawpitch", "translate_mode",
@@ -535,7 +535,7 @@ class X7kRead:
 
     def _ping_and_runtime(self, sub, settings_type, model, serial_one):
         rows = sub.index[sub.RecordType == 7027]
-        recs = [decode_record(self.S.read_record_bytes(r)) for r in rows]
+        recs = [self.S.read_record(r) for r in rows]
         times = self.Index.Time.loc[rows].to_numpy(dtype=float)
         counters = np.array([r["RTH"]["PingNumber"] for r in recs], dtype=np.int64)
         dets = [r["RD"]["Detections"] for r in recs]

@@ -3,6 +3,11 @@ Generic sensor records (1000-1999), 2004 and 3001.
 
 Field names are the DFD 3.10 names in PascalCase. Units are as stored:
 angles in radians, distances in meters.
+
+Verified against real data (see ``PYS7K.verification``): 1003, 1008, 1010,
+1012, 1013, 1015 and 1016, from Reson 7k, Teledyne PDS, HYPACK, NORBIT and
+Fledermaus writers. Tested with synthetic records only: 1000-1002, 1004,
+1005-1007, 1009, 1011, 1014, 1017, 1020, 2004 and 3001.
 """
 
 from ..fields import Section, Table
@@ -38,7 +43,9 @@ _add(HeaderCodec(1001, "Sensor Offset Position", _OFFSET_FIELDS, phase=3))
 _add(HeaderCodec(1002, "Sensor Offset Position Calibrated", _OFFSET_FIELDS, phase=3))
 
 # 1003 - Position (Table 14). NumberOfSatellites is optional: 7125-era
-# files write a 36-byte record without it.
+# files write a 36-byte record without it. Verified against real data:
+# 36 bytes (Reson 7k), 37 bytes (PDS, NORBIT), UTM grid positions
+# (HYPACK) and 35 bytes ending at QualityFlag (Fledermaus, RecordVersion 0).
 _add(HeaderCodec(1003, "Position", [
     ("DatumIdentifier", "u32"),
     ("Latency", "f32"),

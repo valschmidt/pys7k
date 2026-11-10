@@ -29,12 +29,14 @@ import sys
 import numpy as np
 import pandas as pd
 
-from .frame import (CHECKSUM_SIZE, DRF_DTYPE, DRF_SIZE, FLAG_CHECKSUM_VALID,
+from .frame import (CHECKSUM_SIZE, DRF_DTYPE, DRF_OFFSETS, DRF_SIZE, FLAG_CHECKSUM_VALID,
                     SYNC_BYTES, SYNC_PATTERN, S7KChecksumError, S7KError,
                     S7KFormatError, checksum, time7k_to_epoch)
+from .optional_data import recover_misplaced_optional_data
+from .verification import REAL_DATA_VERIFIED
 from .registry import (DEVICE_IDENTIFIERS, PING_RECORD_TYPES, RECORD_CODECS,
-                       RECORD_TYPE_DESCRIPTIONS, decode_record, encode_record,
-                       new, record_name)
+                       MIN_DECODED_PROTOCOL, RECORD_TYPE_DESCRIPTIONS, decode_record,
+                       detect_checksum_trailer, encode_record, new, record_name)
 
 __all__ = ["s7k", "resolve_record_type", "main"]
 
@@ -89,6 +91,8 @@ class s7k:
         self.file_size = None
         self.Index = None
         self.Gaps = []
+        # Whether records end with the 4-byte checksum (set by index_file).
+        self.ChecksumTrailer = True
         self._write_entries = None
         self._mode = None
 
@@ -212,6 +216,11 @@ class s7k:
             byte ranges are listed in ``self.Gaps`` as (offset, length).
 
         :return: ``self.Index``, a pandas DataFrame with one row per record.
+
+        ``self.ChecksumTrailer`` is set to False when the records were
+        written without the 4-byte checksum the DFD requires (Fledermaus
+        navigation files; see ``registry.detect_checksum_trailer``). Every
+        decode from this file then honours that.
         """
         self._ensure_read()
         offsets, self.Gaps = self._walk(strict)
@@ -231,9 +240,12 @@ class s7k:
                 cols["Flags"] = frames["Flags"].astype(np.int64)
                 cols["OptionalDataOffset"] = frames["OptionalDataOffset"].astype(np.int64)
                 cols["OptionalDataIdentifier"] = frames["OptionalDataIdentifier"].astype(np.int64)
+                self.ChecksumTrailer = detect_checksum_trailer(cols["RecordType"], cols["Size"], cols["Flags"])
                 if full:
                     cols.update(self._gather_ping_numbers(file_bytes, offsets, cols))
-                if verify_checksums:
+                if verify_checksums and not self.ChecksumTrailer:
+                    cols["ChecksumValid"] = pd.array([pd.NA] * len(offsets), dtype="boolean")
+                elif verify_checksums:
                     cols["ChecksumValid"] = self._verify_checksums(file_bytes, offsets, cols)
             finally:
                 # Release the view before anything can close the mapping.
@@ -272,7 +284,7 @@ class s7k:
                            dtype=np.uint64, count=len(offsets)) & np.uint64(0xFFFFFFFF)
         stored = file_bytes[ends[:, None] + np.arange(4)].view("<u4").reshape(-1)
         valid = pd.array(sums == stored, dtype="boolean")
-        valid[(cols["Flags"] & FLAG_CHECKSUM_VALID) == 0] = pd.NA
+        valid[((cols["Flags"] & FLAG_CHECKSUM_VALID) == 0) | (cols["ProtocolVersion"] < MIN_DECODED_PROTOCOL)] = pd.NA
         return valid
 
     def check_catalog(self):
@@ -325,7 +337,7 @@ class s7k:
 
     def read_record(self, i):
         """Decode record ``i`` (a row label of ``self.Index``)."""
-        return decode_record(self.read_record_bytes(i))
+        return decode_record(self.read_record_bytes(i), checksum_trailer=self.ChecksumTrailer)
 
     def iter_records(self, record_types=None, devices=None, start_time=None, end_time=None,
                      raw=False):
@@ -360,7 +372,7 @@ class s7k:
         m = self._mmap
         for row, off, size in zip(idx.index[mask], idx.Offset.to_numpy()[mask], idx.Size.to_numpy()[mask]):
             buf = bytearray(m[off:off + size])
-            yield (row, buf) if raw else decode_record(buf)
+            yield (row, buf) if raw else decode_record(buf, checksum_trailer=self.ChecksumTrailer)
 
     def __iter__(self):
         return self.iter_records()
@@ -379,6 +391,9 @@ class s7k:
         Print, and return, a summary of the file's records: for each record
         type, how many records there are and their total, minimum and
         maximum size in bytes, with the share of the file they occupy.
+        "Decoded" says whether the records are decoded field by field;
+        "Real Data" says whether that decoder has been checked against real
+        files (``PYS7K.verification``) or only against synthetic records.
         This mirrors gsfu's report_record_types() and kmall's
         report_packet_types(), and is what the -V command line flag runs.
 
@@ -396,7 +411,14 @@ class s7k:
             "Max Bytes": grouped.Size.max(),
         })
         summary["% of File"] = (summary["Total Bytes"] / max(self.file_size, 1) * 100).round(2)
-        summary["Decoded"] = ["yes" if rt in RECORD_CODECS else "raw" for rt in summary.index]
+        modern = set(idx[idx.ProtocolVersion >= MIN_DECODED_PROTOCOL].RecordType.unique())
+        summary["Decoded"] = ["yes" if rt in RECORD_CODECS and rt in modern else "raw"
+                              for rt in summary.index]
+        # Whether the decoder has been checked against real files (see
+        # PYS7K.verification) or only against synthetic records.
+        summary["Real Data"] = ["" if d == "raw" else
+                                ("yes" if rt in REAL_DATA_VERIFIED else "no")
+                                for rt, d in zip(summary.index, summary["Decoded"])]
         if "ChecksumValid" in idx:
             cv = idx.ChecksumValid
             summary["Checksum OK"] = cv.groupby(idx.RecordType).apply(lambda s: int((s == True).sum()))  # noqa: E712
@@ -457,7 +479,7 @@ class s7k:
         """
         count = 0
         for row, buf in self.iter_records(record_type, raw=True):
-            rec = decode_record(buf)
+            rec = decode_record(buf, checksum_trailer=self.ChecksumTrailer)
             _print_record(rec, row, int(self.Index.at[row, "Offset"]), buf, max_rows)
             print()
             count += 1
@@ -564,7 +586,14 @@ def _print_scalars(d, indent="  "):
         return
     width = max(len(k) for k, _ in items)
     for k, v in items:
-        print("%s%-*s : %s" % (indent, width, k, _fmt_value(v)))
+        note = ""
+        if isinstance(v, (bytes, bytearray)) and len(v) == 10 and "Time" in k:
+            # an embedded 7KTIME (7021 board times, for example)
+            y, d, sec, hh, mm = struct.unpack("<HHfBB", bytes(v))
+            t = time7k_to_epoch(y, d, hh, mm, sec)
+            if t == t:
+                note = "  # 7KTIME: %s" % pd.to_datetime(t, unit="s", utc=True).isoformat(timespec="microseconds")
+        print("%s%-*s : %s%s" % (indent, width, k, _fmt_value(v), note))
 
 
 def _print_table(name, table, max_rows):
@@ -649,7 +678,9 @@ def _print_record(rec, row, offset, buf, max_rows):
         return
     if "Error" in rec:
         print("  # %s" % rec["Error"])
-    if rt in RECORD_CODECS:
+    if "Note" in rec:
+        print("  # %s" % rec["Note"])
+    if (rt in RECORD_CODECS and "Note" not in rec) or rec["RTH"] or rec["RD"]:
         _print_section("RTH", rec["RTH"], max_rows)
         if rec["RD"]:
             _print_section("RD", rec["RD"], max_rows)
@@ -657,14 +688,43 @@ def _print_record(rec, row, offset, buf, max_rows):
         _print_section("OptionalData", rec["OptionalData"], max_rows)
     for part, data in rec["Unparsed"].items():
         if data:
-            label = "Body (no decoder for this record type)" if (
-                part == "Body" and rt not in RECORD_CODECS) else part
+            label = part
+            if part == "Body" and "Note" in rec and not (rec["RTH"] or rec["RD"]):
+                label = "Body (kept raw: old protocol version)"
+            elif part == "Body" and rt not in RECORD_CODECS:
+                label = "Body (no decoder for this record type)"
             print("-- Unparsed %s: %d bytes --" % (label, len(data)))
             print(_ascii(data))
-    stored = rec["Checksum"]
+    recovered = recover_misplaced_optional_data(rec)
+    if recovered is not None:
+        print("  # PDS2000 writer quirk: the snippets are u16 but the record is sized for u32, so")
+        print("  # the real optional data starts at the beginning of Unparsed Body, not at")
+        print("  # OptionalDataOffset. Decoded from there:")
+        _print_section("OptionalData (recovered)", recovered, max_rows)
+    stored = rec.get("Checksum", 0)
+    if stored is None:
+        print("-- Checksum: none  # the record has no checksum field (written without one)")
+        return
+    if frame["ProtocolVersion"] < MIN_DECODED_PROTOCOL:
+        print("-- Checksum: %d  # protocol version %d: Flags bit 0 is not a checksum flag"
+              % (stored, frame["ProtocolVersion"]))
+        return
     if frame["Flags"] & FLAG_CHECKSUM_VALID:
         calc = checksum(buf[:len(buf) - CHECKSUM_SIZE])
         status = "verifies" if calc == stored else "MISMATCH (computed %d)" % calc
+        if calc != stored and stored == len(buf) - CHECKSUM_SIZE:
+            # HYPACK-written 7125 files (2011, 2013) do this in their
+            # 1003/1012/1013 records: the checksum field holds Size - 4.
+            status += "; the stored value is Size - 4, not a checksum"
+        elif calc != stored:
+            # Teledyne PDS 7610 records in 2014 7125 files were checksummed
+            # before the DRF Reserved4 field was filled in.
+            for name in ("Reserved1", "Reserved2", "Reserved3", "Reserved4"):
+                start = DRF_OFFSETS[name]
+                width = 2 if name in ("Reserved1", "Reserved3") else 4
+                if (calc - sum(bytes(buf[start:start + width]))) & 0xFFFFFFFF == stored:
+                    status += "; it matches if the frame's %s bytes are left out" % name
+                    break
     else:
         status = "not flagged as valid (Flags bit 0 clear)"
     print("-- Checksum: %d  # %s" % (stored, status))

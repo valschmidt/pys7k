@@ -204,6 +204,29 @@ class TestReports:
         assert "2 more rows" in out and "# verifies" in out
         assert out.count("=== ") == 1
 
+    def test_print_size_minus_4_checksum(self, tmp_path, capsys):
+        # A 2011 third-party writer stored Size - 4 in the checksum field.
+        data = bytearray(encode_record(new(1013)))
+        data[-4:] = (len(data) - 4).to_bytes(4, "little")
+        path = tmp_path / "c.s7k"
+        path.write_bytes(bytes(data))
+        with s7k(str(path)) as S:
+            S.print_records()
+        out = capsys.readouterr().out
+        assert "MISMATCH" in out and "Size - 4, not a checksum" in out
+
+    def test_print_checksum_without_reserved_field(self, tmp_path, capsys):
+        # Teledyne PDS 7610 records (2014) were checksummed before the
+        # frame's Reserved4 field was filled in.
+        rec = new(7610)
+        data = bytearray(encode_record(rec))
+        data[52:56] = bytes([0x19, 0x0A, 0x00, 0x0A])
+        path = tmp_path / "r.s7k"
+        path.write_bytes(bytes(data))
+        with s7k(str(path)) as S:
+            S.print_records()
+        assert "matches if the frame's Reserved4 bytes are left out" in capsys.readouterr().out
+
     def test_print_unknown_record_as_ascii(self, tmp_path, capsys):
         path = tmp_path / "u.s7k"
         rec = new(4242)
@@ -262,3 +285,73 @@ def test_index_dataframe_types(synthetic_file):
         idx = S.index_file(full=True)
         assert isinstance(idx, pd.DataFrame)
         assert idx.Offset.dtype == np.int64 and idx.Time.dtype == np.float64
+
+
+def test_records_without_checksum_trailer(tmp_path):
+    """Fledermaus navigation files leave out the 4-byte checksum: Size is
+    64 + body. The trailer is detected per file and honoured both ways."""
+    from PYS7K import derived as D
+    data = b""
+    for i in range(3):
+        nav = make_record(1003, T0 + i, LatitudeOrNorthing=0.47, LongitudeOrEasting=-1.58)
+        nav["Frame"].update(Flags=0, RecordVersion=0)
+        for k in ("PositioningMethod", "NumberOfSatellites"):
+            nav["RTH"][k] = None                      # Fledermaus writes 35 bytes
+        dep = make_record(1008, T0 + i, Depth=1487.4 + i)
+        dep["Frame"].update(Flags=0, RecordVersion=0)
+        for rec in (nav, dep):
+            rec["Checksum"] = None
+            data += encode_record(rec)
+    path = tmp_path / "fm.s7k"
+    path.write_bytes(data)
+    assert len(data) == 3 * (64 + 35 + 64 + 8)
+    with s7k(str(path)) as S:
+        S.index_file(verify_checksums=True)
+        assert S.ChecksumTrailer is False
+        assert S.Index.ChecksumValid.isna().all()
+        recs = list(S.iter_records())
+        assert recs[1]["RTH"]["Depth"] == pytest.approx(1487.4)
+        assert recs[0]["Checksum"] is None and not any(recs[0]["Unparsed"].values())
+        assert b"".join(encode_record(r) for r in recs) == data
+        assert np.allclose(D.gather_header(S, 1008)["Depth"], [1487.4, 1488.4, 1489.4])
+
+
+def test_checksum_trailer_detected_on_normal_files(synthetic_file):
+    with s7k(str(synthetic_file)) as S:
+        S.index_file()
+        assert S.ChecksumTrailer is True
+
+
+def test_checksum_trailer_kept_when_flags_clear(tmp_path):
+    """NORBIT files set no checksum flags but still carry the trailer."""
+    data = b""
+    for i in range(3):
+        for rec in (make_record(1003, T0 + i), make_record(1012, T0 + i)):
+            rec["Frame"]["Flags"] = 0
+            data += encode_record(rec)
+    path = tmp_path / "nb.s7k"
+    path.write_bytes(data)
+    with s7k(str(path)) as S:
+        S.index_file()
+        assert S.ChecksumTrailer is True
+
+
+def test_protocol_2_frame_in_64_bytes_kept_raw(tmp_path, capsys):
+    """A protocol 2 record without the 72-byte protocol-2 frame stays raw,
+    and its Flags position is not read as a checksum flag."""
+    rec = new(1004)
+    rec["Frame"].update(ProtocolVersion=2, Flags=241)
+    rec["Unparsed"]["Body"] = bytes.fromhex("0bcd0300000000001e42093cfdad003c0ad7a33c")
+    rec["Checksum"] = 0
+    data = encode_record(rec)
+    assert data[-4:] == bytes(4)                     # Flags bit 0 set, yet no checksum computed
+    path = tmp_path / "p2.s7k"
+    path.write_bytes(data)
+    with s7k(str(path)) as S:
+        S.index_file(verify_checksums=True)
+        assert S.Index.ChecksumValid.isna().all()
+        out = list(S.iter_records())[0]
+        assert "Note" in out and out["RTH"] == {} and encode_record(out) == data
+        S.print_records()
+    text = capsys.readouterr().out
+    assert "predates DFD 3.10" in text and "not a checksum flag" in text

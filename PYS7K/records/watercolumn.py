@@ -4,9 +4,15 @@ Water column, imagery and detection records added in phase 2:
 
 (7007, 7008, 7010, 7018 and 7028 are in ``sonar.py``.)
 
-None of the local sample files contain these records, so each layout is
-transcribed from DFD 3.10 and tested by synthetic round trips only.
-Assumptions where the DFD is incomplete are noted on each codec.
+Each layout is transcribed from DFD 3.10. Assumptions where the DFD is
+incomplete are noted on each codec.
+
+Verified against real data (see ``PYS7K.verification``): 7011 (Reson 7125,
+2006-2015), 7012 (7kCenter 6.1, and 2010 files), 7041 (7kCenter 5.2,
+which writes the DFD 2.20-2.31 header), 7042 (NORBIT STX and WBMS,
+2023-2024), 7048 and 7057 (2010 7125 files; their 7048 is stored beam by
+beam) and 7058 (T50-R, 7kCenter 6.3). Tested with synthetic records only:
+7014, 7019, 7029 and 7047.
 """
 
 import numpy as np
@@ -26,6 +32,10 @@ class _Image(Codec):
     """
     7011 - Image Data (Tables 55-56). H rows of W pixels, ColorDepth bytes
     each, decoded as an (H, W) unsigned array. The RTH has no SonarId.
+
+    Verified against real data: 7125 files from 2006-2015 (RDR 1.2 to
+    7kCenter 6.0). The 1024 x 512 image matches the 7008 water column of
+    the same ping in shape and orientation.
     """
 
     record_type = 7011
@@ -78,7 +88,17 @@ class _PingMotion(Codec):
     """
     7012 - Ping Motion Data (Table 57). Flags bits 0-3 say which fields
     follow the header: Pitch (one f32), then Roll, Heading and Heave (N f32
-    each).
+    each). DFD 2.20 lists Flags as u32; the 2010 and 2015 files fit the
+    3.10 u16 (their SamplingRate is plausible only at the 3.10 offset).
+
+    Verified against real data: 7kCenter 6.1 files (2014-2015, 7125 and
+    T20-P) with Flags 2 (roll only), N equal to the ping's sample count,
+    and SamplingRate equal to the 7000 record's. 2010 RDR 1.2-era 7125
+    files write the same layout, with N equal to the ping's 7018/7008
+    sample count, but most of their records carry extra bytes after the
+    arrays (anywhere from 4 bytes to 24 KB, varying from ping to ping) that
+    hold roll-like values, apparently stale contents of a reused buffer.
+    They are kept in ``Unparsed["Body"]``.
     """
 
     record_type = 7012
@@ -268,6 +288,29 @@ class _CompressedBeamformed(Codec):
     the width that makes the beams fill the record exactly. ``Beams`` holds
     each beam's identifier and count; ``Samples`` holds every beam's
     samples concatenated.
+
+    Two header forms exist, and the one that makes the beams fill the
+    record exactly is used (the DFD 3.10 form is tried first):
+
+    * DFD 2.41 and later (38 bytes): Flags is u16, with the beam
+      identifier type in bit 8.
+    * DFD 2.20 to 2.31 (2011-2013, 44 bytes): DownsamplingMethod (u8),
+      FilteringMethod (u8), Flags (u32: bits 0-3 data encoding, bit 4 beam
+      identifier type), MagnitudeEncoding (u8) and PhaseEncoding (u8) in
+      place of the u16 Flags. Data encodings 0-6 are 16-bit magnitude, 8-bit
+      magnitude, 16-bit magnitude and phase, 8-bit magnitude and phase,
+      32-bit, 16-bit and 8-bit calibrated magnitude. Such records decode
+      with those extra RTH keys.
+
+    Verified against real data: 7125 files from 7kCenter 5.2.2.7 (2013)
+    use the DFD 2.2x header (DownsamplingMethod 1, nearest neighbour;
+    FilteringMethod 0; Flags 0, 16-bit magnitude by beam number). An
+    earlier pys7k release read its first two bytes as a u16 Flags of 1
+    followed by six "undocumented" bytes. Their SampleRate (999.5 Hz) and
+    sample counts (198 per beam) match the 7000 range setting (150 m).
+    For DFD 3.10 headers, Flags bits 0-1 are "always 1 for backward
+    compatibility with 7111 systems", so the width is found by fitting
+    the record whenever more than one width is possible.
     """
 
     record_type = 7041
@@ -280,6 +323,20 @@ class _CompressedBeamformed(Codec):
         ("SampleRate", "f32"),
         ("Reserved", "u32*4"),
     ])
+    # DFD 2.20-2.31 (Table 68 in 2.20)
+    rth_dfd22 = Section(PING_PREFIX + [
+        ("N", "u16"),
+        ("DownsamplingMethod", "u8"),
+        ("FilteringMethod", "u8"),
+        ("Flags", "u32"),
+        ("MagnitudeEncoding", "u8"),
+        ("PhaseEncoding", "u8"),
+        ("SampleRate", "f32"),
+        ("Reserved", "u32*4"),
+    ])
+    # DFD 2.2x data encoding (Flags bits 0-3) -> bytes per sample
+    _DFD22_WIDTH = {0: 2, 1: 1, 2: 4, 3: 2, 4: 4, 5: 2, 6: 1}
+    _DT = {1: "u1", 2: "<u2", 4: "<u4"}
 
     def new_rth(self):
         return self.rth.new()
@@ -305,21 +362,37 @@ class _CompressedBeamformed(Codec):
         return ids, counts, starts, pos
 
     def decode(self, body):
-        rth = self.rth.unpack(body, 0)
-        pos = self.rth.size
-        id_dt = "<f4" if rth["Flags"] & 0x100 else "<u2"
-        code = rth["Flags"] & 3
-        widths = [code] if code in (1, 2) else []
-        widths += [w for w in (1, 2) if w not in widths]
-        walk = None
-        for width in widths:
-            walk = self._walk(body, pos, rth["N"], id_dt, width)
-            if walk is not None and (walk[3] == len(body) or width == widths[-1]):
+        best = None
+        for section in (self.rth, self.rth_dfd22):
+            if len(body) < section.size:
+                continue
+            rth = section.unpack(body, 0)
+            if section is self.rth:
+                id_dt = "<f4" if rth["Flags"] & 0x100 else "<u2"
+                code = rth["Flags"] & 3
+                widths = [code] if code in (1, 2) else []
+            else:
+                id_dt = "<f4" if rth["Flags"] & 0x10 else "<u2"
+                code = self._DFD22_WIDTH.get(rth["Flags"] & 0xF)
+                widths = [code] if code else []
+            widths += [w for w in (1, 2) if w not in widths]
+            for width in widths:
+                walk = self._walk(body, section.size, rth["N"], id_dt, width)
+                if walk is None:
+                    continue
+                if walk[3] == len(body):
+                    best = (rth, id_dt, width, walk)
+                    break
+                if best is None:
+                    best = (rth, id_dt, width, walk)
+            if best is not None and best[3][3] == len(body):
                 break
-        if walk is None:
-            return rth, {}, pos
+        if best is None:
+            rth = self.rth.unpack(body, 0)
+            return rth, {}, self.rth.size
+        rth, id_dt, width, walk = best
         ids, counts, starts, end = walk
-        dt = "u1" if width == 1 else "<u2"
+        dt = self._DT[width]
         samples = np.concatenate([np.frombuffer(body, dt, c, s) for c, s in zip(counts, starts)]) \
             if counts else np.zeros(0, dt)
         rd = {"Beams": {"Beam": np.array(ids, dtype=id_dt), "Samples": np.array(counts, dtype="<u4")},
@@ -328,11 +401,13 @@ class _CompressedBeamformed(Codec):
 
     def encode(self, record):
         rd = record["RD"]
-        out = [self.rth.pack(record["RTH"])]
+        dfd22 = record["RTH"].get("DownsamplingMethod") is not None
+        section = self.rth_dfd22 if dfd22 else self.rth
+        out = [section.pack(record["RTH"])]
         if "Beams" not in rd:
             return out[0]
-        id_dt = "<f4" if record["RTH"]["Flags"] & 0x100 else "<u2"
-        dt = "u1" if rd.get("SampleWidth", 1) == 1 else "<u2"
+        id_dt = "<f4" if record["RTH"]["Flags"] & (0x10 if dfd22 else 0x100) else "<u2"
+        dt = self._DT[rd.get("SampleWidth", 1)]
         samples = np.asarray(rd["Samples"], dt)
         pos = 0
         for bid, cnt in zip(rd["Beams"]["Beam"], rd["Beams"]["Samples"]):
@@ -379,6 +454,11 @@ class _CompressedWaterColumn(Codec):
     ``Beams`` holds each beam's number, segment and sample count;
     ``Samples`` holds every beam's samples concatenated, as one column per
     component.
+
+    Verified against real data: NORBIT STX (2024) and WBMS (2023) files,
+    including 2x middle-value downsampling (Flags 0x122) with FirstSample
+    in downsampled units; 7027 detections line up with the bottom echo
+    (see ``derived.read_watercolumn``).
     """
 
     record_type = 7042
@@ -550,8 +630,21 @@ _add(_SegmentedDetection())
 
 
 class _CalibratedBeam(Codec):
-    """7048 - Calibrated Beam Data (Tables 86-87): S x N f32 intensities,
-    stored sample by sample, decoded as an (S, N) array."""
+    """
+    7048 - Calibrated Beam Data (Tables 86-87): S x N f32 intensities,
+    decoded as an (S, N) array ``Intensity``.
+
+    DFD 3.10 stores them sample by sample. Verified against real data:
+    RDR 1.2-era 7125 files from 2010 (ErrorFlag 5, so the values are the
+    uncalibrated beamformed amplitudes) store them beam by beam instead,
+    and end with N x 14 zero bytes. Stored beam by beam, they equal the
+    same ping's 7018 amplitudes exactly; read sample by sample they do
+    not. Records with that trailing padding are therefore decoded beam by
+    beam, with ``RD["BeamMajor"]`` True (the padding stays in
+    ``Unparsed["Body"]``), and are written back in the order they were
+    stored. Records of the DFD size are decoded sample by sample, which
+    has not been checked against real data.
+    """
 
     record_type = 7048
     name = "Calibrated Beam Data"
@@ -575,15 +668,24 @@ class _CalibratedBeam(Codec):
     def decode(self, body):
         rth = self.rth.unpack(body, 0)
         pos = self.rth.size
-        n = rth["N"] * rth["S"]
+        nb, ns = rth["N"], rth["S"]
+        n = nb * ns
         if pos + 4 * n > len(body):
             return rth, {}, pos
-        return rth, {"Intensity": np.frombuffer(body, "<f4", n, pos).reshape(rth["S"], rth["N"])}, pos + 4 * n
+        values = np.frombuffer(body, "<f4", n, pos)
+        extra = bytes(body[pos + 4 * n:])
+        if nb and len(extra) == 14 * nb and not any(extra):
+            return rth, {"Intensity": values.reshape(nb, ns).T, "BeamMajor": True}, pos + 4 * n
+        return rth, {"Intensity": values.reshape(ns, nb)}, pos + 4 * n
 
     def encode(self, record):
         out = self.rth.pack(record["RTH"])
-        if "Intensity" in record["RD"]:
-            out += np.asarray(record["RD"]["Intensity"], "<f4").tobytes()
+        rd = record["RD"]
+        if "Intensity" in rd:
+            data = np.asarray(rd["Intensity"], "<f4")
+            if rd.get("BeamMajor"):
+                data = data.T
+            out += np.ascontiguousarray(data).tobytes()
         return out
 
 
@@ -595,6 +697,13 @@ class _CalibratedSideScan(Codec):
     7057 - Calibrated Side-Scan Data (Tables 98-99). Port then starboard
     series of S samples (f32 when W is 4, f64 when W is 8), then the port
     and starboard beam numbers (S u16 each).
+
+    ``Reserved1`` (8 f32) held the port and starboard beam widths (y, z)
+    and steering angles (y, z) in DFD 2.20-2.31; DFD 2.41 reserved them.
+    They are zero in the 2010 files seen.
+
+    Verified against real data: 2010 RDR 1.2-era 7125 files (W = 4, with
+    ErrorFlag 5) decode with no bytes left over and plausible series.
     """
 
     record_type = 7057
@@ -657,6 +766,11 @@ class _SnippetBackscatter(Codec):
     A beam whose EndSample is below its BeginSample has no samples (DFD
     note). ``BackscatterStrength`` and ``Footprints`` hold all beams
     concatenated.
+
+    Verified against real data: T50-R files from 7kCenter 6.3 (2018), with
+    footprints (ControlFlags bit 6). The beams' sample counts add up to the
+    stored array lengths exactly, N equals the same ping's 7027 N, and the
+    median backscatter is about -31 dB.
     """
 
     record_type = 7058

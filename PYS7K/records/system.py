@@ -1,5 +1,9 @@
 """
 File, time, and environment records: 7200, 7300, 7400, 7610-7614.
+
+Verified against real data (see ``PYS7K.verification``): 7200, 7300 and
+7610 (both the 4-byte short form and the 12-byte full form). Tested with
+synthetic records only: 7400 and 7611-7614.
 """
 
 from ..fields import Section, Table
@@ -93,6 +97,11 @@ _add(HeaderCodec(7400, "Time Message", [
 ], phase=3))
 
 # 7610 - Sound Velocity (Table 117). Temperature and Pressure are optional.
+# Verified against real data: NORBIT, 7kCenter 5.3 and PDS write the 4-byte
+# form (SoundVelocity only); PDS also writes the full 12-byte form. The
+# 4-byte form is the whole record up to DFD 2.22 (2012); DFD 2.31 (2013)
+# added Temperature and Pressure, which DFD 2.41 says are "not present with
+# a version of the IO Module older than V4.0.0.8".
 _add(HeaderCodec(7610, "Sound Velocity", [
     ("SoundVelocity", "f32"),
     ("Temperature", "f32"),

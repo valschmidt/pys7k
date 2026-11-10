@@ -8,6 +8,8 @@ including ones with no codec yet, so reports can label them.
 
 import struct
 
+import numpy as np
+
 from .frame import (CHECKSUM_SIZE, DRF, DRF_SIZE, FLAG_CHECKSUM_VALID,
                     S7KFormatError, checksum)
 from .optional_data import OPTIONAL_DATA_CODECS
@@ -17,6 +19,7 @@ from .records.base import new_record
 __all__ = [
     "RECORD_CODECS", "RECORD_TYPE_DESCRIPTIONS", "DEVICE_IDENTIFIERS",
     "PING_RECORD_TYPES", "record_name", "new", "decode_record", "encode_record",
+    "detect_checksum_trailer", "MIN_DECODED_PROTOCOL",
 ]
 
 RECORD_CODECS = {c.record_type: c for c in ALL_CODECS}
@@ -36,13 +39,13 @@ RECORD_TYPE_DESCRIPTIONS = {
     7002: "Match Filter", 7003: "Firmware and Hardware Configuration",
     7004: "Beam Geometry", 7005: "Reserved (calibration data)",
     7006: "Bathymetric Data", 7007: "Side Scan Data",
-    7008: "Generic Water Column Data", 7009: "Reserved (vertical depth)",
+    7008: "Generic Water Column Data", 7009: "Vertical Depth",
     7010: "TVG Values", 7011: "Image Data", 7012: "Ping Motion Data",
     7014: "Adaptive Gate", 7016: "Reserved (extended bottom detect)",
     7017: "Detection Data Setup", 7018: "Beamformed Data",
     7019: "Vernier Processing Data (Raw)", 7021: "Built-In Test Environment Data",
     7022: "Sonar Source Version", 7023: "8k Wet End Version",
-    7024: "Reserved (license)", 7026: "Reserved (detection data)",
+    7024: "Reserved (license)", 7026: "Detection Data (no layout published; dropped in DFD 2.11)",
     7027: "Raw Detection Data", 7028: "Snippet Data",
     7029: "Vernier Processing Data (Filtered)", 7030: "Sonar Installation Parameters",
     7031: "Built-In Test Environment Data (Summary)", 7037: "Reserved",
@@ -102,6 +105,11 @@ PING_RECORD_TYPES = frozenset(rt for rt, c in RECORD_CODECS.items() if c.ping)
 
 _U32 = struct.Struct("<I")
 
+# Record bodies, optional data and the Flags checksum bit are interpreted
+# with DFD 3.10 layouts for this protocol version and later (DFD 3.10 is
+# protocol 5). Bodies of records with an older protocol are kept raw.
+MIN_DECODED_PROTOCOL = 5
+
 
 def record_name(record_type):
     """A human-readable name for ``record_type``."""
@@ -121,13 +129,19 @@ def new(record_type):
     return rec
 
 
-def decode_record(data, offset=0):
+def decode_record(data, offset=0, checksum_trailer=True):
     """
     Decode one record.
 
     :param data: a buffer holding the record. It is not copied: arrays in
         the result are views into it.
     :param offset: where the record starts in ``data``.
+    :param checksum_trailer: False for records written without the 4-byte
+        checksum the DFD requires (Fledermaus-written navigation files do
+        this: their Size is 64 + body). The record then decodes with
+        ``Checksum`` None, and ``encode_record`` writes it back without a
+        trailer. ``s7k.index_file`` detects this per file (see
+        ``detect_checksum_trailer``).
 
     :return: the record dictionary (see ``records.base``). A record whose
         frame is self-inconsistent (optional data offset outside the record,
@@ -137,25 +151,32 @@ def decode_record(data, offset=0):
     :raises S7KFormatError: the buffer does not hold a whole record frame.
     """
     mv = memoryview(data)
-    if len(mv) - offset < DRF_SIZE + CHECKSUM_SIZE:
+    tail = CHECKSUM_SIZE if checksum_trailer else 0
+    if len(mv) - offset < DRF_SIZE + tail:
         raise S7KFormatError("buffer too short for a record at offset %d" % offset)
     frame = DRF.unpack(mv, offset)
     size = frame["Size"]
     rt = frame["RecordTypeIdentifier"]
-    if size < DRF_SIZE + CHECKSUM_SIZE or offset + size > len(mv):
+    if size < DRF_SIZE + tail or offset + size > len(mv):
         raise S7KFormatError("record at offset %d has bad size %d" % (offset, size))
     rec_mv = mv[offset:offset + size]
     rth_start = 4 + frame["Offset"]
     odo = frame["OptionalDataOffset"]
-    body_end = odo if odo else size - CHECKSUM_SIZE
-    if rth_start < DRF_SIZE or rth_start > body_end or body_end > size - CHECKSUM_SIZE:
+    body_end = odo if odo else size - tail
+    if rth_start < DRF_SIZE or rth_start > body_end or body_end > size - tail:
         return {
             "RecordType": rt, "Frame": frame, "Raw": bytes(rec_mv),
             "Error": "inconsistent frame offsets (Offset=%d, OptionalDataOffset=%d, Size=%d)"
                      % (frame["Offset"], odo, size),
         }
-    codec = RECORD_CODECS.get(rt)
+    # DFD 3.10 describes protocol version 5. Older protocols have other
+    # layouts, so their bodies are kept raw.
+    pv = frame["ProtocolVersion"]
+    modern = pv >= MIN_DECODED_PROTOCOL
+    codec = RECORD_CODECS.get(rt) if modern else None
     rec = new_record(rt, codec)
+    if not modern:
+        rec["Note"] = "protocol version %d predates DFD 3.10 (protocol 5); the body is kept raw" % pv
     rec["Frame"] = frame
     rec["Unparsed"]["Frame"] = bytes(rec_mv[DRF_SIZE:rth_start])
     body = rec_mv[rth_start:body_end]
@@ -168,15 +189,20 @@ def decode_record(data, offset=0):
             rec["Error"] = "decode failed: %s" % exc
     rec["Unparsed"]["Body"] = bytes(body[used:])
     if odo:
-        od_buf = rec_mv[odo:size - CHECKSUM_SIZE]
-        od_codec = OPTIONAL_DATA_CODECS.get(rt)
+        od_buf = rec_mv[odo:size - tail]
+        od_codec = OPTIONAL_DATA_CODECS.get(rt) if modern else None
         od_used = 0
         if od_codec is not None:
             rec["OptionalData"], od_used = od_codec.decode(od_buf)
         else:
             rec["OptionalData"] = {}
         rec["Unparsed"]["OptionalData"] = bytes(od_buf[od_used:])
+    if not checksum_trailer:
+        rec["Checksum"] = None
+        return rec
     rec["Checksum"] = _U32.unpack_from(rec_mv, size - CHECKSUM_SIZE)[0]
+    if modern and frame["Flags"] & FLAG_CHECKSUM_VALID:
+        rec["ChecksumValid"] = checksum(rec_mv[:size - CHECKSUM_SIZE]) == rec["Checksum"]
     return rec
 
 
@@ -189,22 +215,33 @@ def encode_record(record, checksum_mode="auto"):
 
     :param checksum_mode:
         * ``"auto"`` (default): compute the checksum when Flags bit 0 (valid
-          checksum) is set, otherwise write ``record["Checksum"]`` as
-          stored. Unmodified records from a file therefore come back byte
-          for byte, and edited records get a correct checksum.
+          checksum) is set (protocol 5 and later only), otherwise write
+          ``record["Checksum"]`` as stored. The exception is a record that was read with a checksum
+          that did not verify (``record["ChecksumValid"] is False``): its
+          stored checksum is written back, so damaged or hand-edited
+          records are preserved as found. Unmodified records from a file
+          therefore always come back byte for byte, and edited records with
+          a good checksum get a correct one. To repair a bad checksum, use
+          ``"recompute"``.
         * ``"recompute"``: always compute it.
         * ``"keep"``: always write ``record["Checksum"]``.
+
+        A record whose ``Checksum`` is None (read from a file written
+        without checksum trailers) is written without one, unless its Flags
+        bit 0 is set or ``checksum_mode`` is ``"recompute"``.
     """
     if "Raw" in record:
         return bytes(record["Raw"])
     rt = record["RecordType"]
-    codec = RECORD_CODECS.get(rt)
+    pv = record["Frame"]["ProtocolVersion"]
+    modern = pv >= MIN_DECODED_PROTOCOL
+    codec = RECORD_CODECS.get(rt) if modern else None
     unparsed = record.get("Unparsed") or {}
     frame_extra = bytes(unparsed.get("Frame", b""))
     body = (codec.encode(record) if codec is not None else b"") + bytes(unparsed.get("Body", b""))
     od = b""
     if record.get("OptionalData") is not None:
-        od_codec = OPTIONAL_DATA_CODECS.get(rt)
+        od_codec = OPTIONAL_DATA_CODECS.get(rt) if modern else None
         if od_codec is not None and record["OptionalData"]:
             od = od_codec.encode(record["OptionalData"])
         od += bytes(unparsed.get("OptionalData", b""))
@@ -213,12 +250,52 @@ def encode_record(record, checksum_mode="auto"):
     frame["Offset"] = head - 4
     frame["RecordTypeIdentifier"] = rt
     frame["OptionalDataOffset"] = head + len(body) if record.get("OptionalData") is not None else 0
-    frame["Size"] = head + len(body) + len(od) + CHECKSUM_SIZE
+    flagged = frame["ProtocolVersion"] >= MIN_DECODED_PROTOCOL and frame["Flags"] & FLAG_CHECKSUM_VALID
+    no_trailer = record.get("Checksum", 0) is None and checksum_mode != "recompute" and not flagged
+    frame["Size"] = head + len(body) + len(od) + (0 if no_trailer else CHECKSUM_SIZE)
     out = DRF.pack(frame) + frame_extra + body + od
-    if checksum_mode == "recompute" or (checksum_mode == "auto" and frame["Flags"] & FLAG_CHECKSUM_VALID):
+    if no_trailer:
+        return out
+    if checksum_mode == "recompute" or (checksum_mode == "auto" and flagged
+                                        and record.get("ChecksumValid") is not False):
         cs = checksum(out)
     elif checksum_mode in ("auto", "keep"):
-        cs = int(record.get("Checksum", 0)) & 0xFFFFFFFF
+        cs = int(record.get("Checksum") or 0) & 0xFFFFFFFF
     else:
         raise ValueError("checksum_mode must be 'auto', 'recompute' or 'keep'")
     return out + _U32.pack(cs)
+
+
+def detect_checksum_trailer(record_types, sizes, flags):
+    """
+    Decide whether a file's records end with the 4-byte checksum.
+
+    The DFD requires it, and every Reson, PDS, HYPACK and NORBIT file seen
+    has it, but Fledermaus-written navigation files (1003/1008 records,
+    RecordVersion 0) leave it out. Any record with Flags bit 0 set means
+    the trailer is present. Otherwise each record of a type with a
+    header-only layout votes: its body length with and without a trailer
+    either does or does not end on a field boundary. The trailer is assumed
+    absent only when some records vote for that and none vote against.
+
+    :param record_types, sizes, flags: index columns (array-likes).
+    :return: True if the records carry checksums.
+    """
+    record_types = np.asarray(record_types)
+    sizes = np.asarray(sizes, dtype=np.int64)
+    flags = np.asarray(flags)
+    if len(sizes) == 0 or (flags & FLAG_CHECKSUM_VALID).any():
+        return True
+    without = with_ = 0
+    for rt in np.unique(record_types):
+        codec = RECORD_CODECS.get(int(rt))
+        bounds = getattr(codec, "field_boundaries", None)
+        if bounds is None:
+            continue
+        bounds = bounds()
+        body = sizes[record_types == rt] - DRF_SIZE
+        a = np.isin(body, bounds)                    # no trailer
+        b = np.isin(body - CHECKSUM_SIZE, bounds)    # with trailer
+        without += int((a & ~b).sum())
+        with_ += int((b & ~a).sum())
+    return not (without > 0 and with_ == 0)

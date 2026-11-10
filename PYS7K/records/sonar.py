@@ -4,6 +4,10 @@ SeaBat 7k sonar records (7000-7099) and 7503.
 Field names are the DFD 3.10 names in PascalCase. Values are as stored:
 angles in radians, times in seconds, detections in fractional samples, and
 bit fields as integers (see ``PYS7K.bitfields`` to expand them).
+
+Verified against real data (see ``PYS7K.verification``): 7000-7002, 7004,
+7006-7010, 7017, 7018, 7022, 7027 (22, 26 and 34-byte detections), 7028,
+7030, 7038 and 7503. Tested with synthetic records only: 7003 and 7023.
 """
 
 import numpy as np
@@ -124,7 +128,11 @@ class _Configuration(Codec):
 
 _add(_Configuration())
 
-# 7002 - Match Filter (Table 42)
+# 7002 - Match Filter (Table 42). Verified against real data: 2009 RDR 1.2
+# files write a 24-byte form (SonarId through StopFrequency; the rest
+# decode as None), which is the whole record in DFD 1.00 (2006); DFD 2.20
+# adds WindowType, ShadingValue and Reserved. 7kCenter 6.0-6.3 files write
+# the full 88-byte form.
 _add(HeaderCodec(7002, "Match Filter", [
     ("SonarId", "u64"),
     ("PingNumber", "u32"),
@@ -193,7 +201,10 @@ _UINT = {1: "<u1", 2: "<u2", 4: "<u4"}
 
 class _SideScan(Codec):
     """7007 - Side Scan Data (Tables 48-49). Port then starboard, S samples
-    of W bytes each."""
+    of W bytes each.
+
+    Verified against real data from RDR 1.2 (2006-2011), 7kCenter 3.7-6.1,
+    PDS 3.6-3.9, HYPACK and NORBIT files (W = 2)."""
 
     record_type = 7007
     name = "Side Scan Data"
@@ -284,6 +295,11 @@ class _GenericWaterColumn(Codec):
     order. With RowColumnFlag 0, beam 0's samples come first, then beam
     1's. With RowColumnFlag 1, sample 0 of every beam comes first. Use
     ``derived.read_watercolumn`` for a samples-by-beams image.
+
+    Verified against real data: RDR 1.2 (2005-2011, RowColumnFlag 1, and
+    RecordSubsetFlag 1 with RowColumnFlag 0), 7kCenter 3.7-6.0, HYPACK and
+    PDS 2.3. Reson's own recorders, like HYPACK, write 7008 without a
+    checksum.
     """
 
     record_type = 7008
@@ -336,7 +352,24 @@ class _GenericWaterColumn(Codec):
 
 _add(_GenericWaterColumn())
 
-# 7010 - TVG Values (Table 53, read from the DFD text)
+# 7009 - Vertical Depth. DFD 3.10 lists 7009 as reserved. This layout is the
+# one in older 7k DFDs (2.x). Verified against a 2014 7125 file written by
+# Teledyne PDS2000 3.9.2: 42-byte records whose position, heading and ping
+# number agree with the matching 7028 optional data.
+_add(HeaderCodec(7009, "Vertical Depth", [
+    ("Frequency", "f32"),
+    ("PingNumber", "u32"),
+    ("MultiPingSequence", "u16"),
+    ("Latitude", "f64"),
+    ("Longitude", "f64"),
+    ("Heading", "f32"),
+    ("AlongTrackDistance", "f32"),
+    ("AcrossTrackDistance", "f32"),
+    ("VerticalDepth", "f32"),
+]))
+
+# 7010 - TVG Values (Table 53, read from the DFD text). Verified against
+# 7kCenter 6.0, 6.1 and 6.3 files: one f32 gain per sample, about 53 dB.
 _add(HeaderTableCodec(7010, "TVG Values", PING_PREFIX + [
     ("N", "u32"),
     ("Reserved", "u32*8"),
@@ -377,6 +410,10 @@ class _Beamformed(Codec):
     7018 - Beamformed Data (Tables 63-64). Amplitude (u16) and phase (i16)
     for every sample of every beam, stored sample by sample. Decoded as
     arrays of shape (Samples, Beams).
+
+    Verified against real data: 7kCenter 3.7-6.1 files (2010-2015, 7125 and
+    T20-P), written without checksums. The amplitude image's bottom echo
+    lies on the same ping's 7027 detections.
     """
 
     record_type = 7018
@@ -417,7 +454,9 @@ _add(HeaderCodec(7023, "8k Wet End Version", [("VersionString", "c8*32")], phase
 
 # 7027 - Raw Detection Data (Tables 71-72). The per-detection size
 # (DataFieldSize) is 22 bytes in DFD 2.20-era files, 26 in 2.41 and 34 in
-# 3.10. Only the fields that fit are decoded.
+# 3.10. Only the fields that fit are decoded. All three are verified
+# against real data: 22 (7kCenter 3.x-5.x, PDS 3.6-3.9, HYPACK), 26
+# (7kCenter 5.4/6.1, NORBIT) and 34 (7kCenter 6.3, T50-R).
 _add(HeaderTableCodec(7027, "Raw Detection Data", PING_PREFIX + [
     ("N", "u32"),
     ("DataFieldSize", "u32"),
@@ -446,6 +485,16 @@ class _Snippet(Codec):
     beam's snippet, SnippetEnd - SnippetStart + 1 samples long. Samples are
     u16, or u32 when Flags bit 0 is set. ``Samples`` holds every snippet
     concatenated in file order.
+
+    Verified against real data: 7125 files from 2012 and 2016 (7k logger,
+    RDR 2.0) decode with no bytes left over and round-trip byte for byte.
+
+    Known writer quirk: Teledyne PDS2000 3.9.x (2014 7125 and T20-P files)
+    writes u16 snippets but sizes the record and places OptionalDataOffset
+    as if they were u32. The record still round-trips exactly, but its real
+    optional data sits in ``Unparsed["Body"]`` and the declared optional
+    data holds zeros or stale bytes. Use
+    ``optional_data.recover_misplaced_optional_data`` to read it.
     """
 
     record_type = 7028

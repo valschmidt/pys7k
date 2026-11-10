@@ -35,6 +35,18 @@ class TestDerived:
         assert np.allclose(a["1013"]["Heading"], 90.0)
         assert np.allclose(a["1012"]["Time"], T0 + np.arange(3), atol=1e-5)
 
+    def test_attitude_in_degrees_warns(self, tmp_path):
+        # A 2011 third-party writer stored 1013 heading in degrees.
+        path = tmp_path / "deg.s7k"
+        w = s7k(str(path))
+        w.OpenFiletoWrite()
+        w.write_record(make_record(1013, T0, Heading=260.81))
+        w.closeFile()
+        with s7k(str(path)) as S:
+            with pytest.warns(UserWarning, match="not radians"):
+                a = D.read_attitude(S)
+        assert np.allclose(a["1013"]["Heading"], 260.81, atol=1e-4)
+
     def test_attitude_1016(self, tmp_path):
         rec = make_record(1016, T0, N=2)
         rec["RD"]["Samples"] = {"TimeDifference": np.array([0, 250], "<u2"), "Roll": np.zeros(2, "<f4"),

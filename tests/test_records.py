@@ -58,6 +58,17 @@ class TestFrameHandling:
         with pytest.raises(ValueError):
             encode_record(rec, "bogus")
 
+    def test_bad_stored_checksum_round_trips(self):
+        # Seen in 2006 7125 files whose timestamps were edited after
+        # recording without recomputing the checksum.
+        data = bytearray(encode_record(new(1013)))
+        data[-4:] = (int.from_bytes(data[-4:], "little") + 1).to_bytes(4, "little")
+        rec = decode_record(data)
+        assert rec["ChecksumValid"] is False
+        assert encode_record(rec) == bytes(data)
+        assert decode_record(encode_record(rec, "recompute"))["ChecksumValid"] is True
+        assert decode_record(encode_record(new(1013)))["ChecksumValid"] is True
+
     def test_unknown_record_type_passes_through(self):
         rec = new(9999)
         rec["Unparsed"]["Body"] = b"hello world"

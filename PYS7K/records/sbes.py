@@ -1,7 +1,8 @@
 """
 Single-beam echo sounder records (10000-10062), added in phase 3.
 
-No local sample file contains SBES records. Layouts are transcribed from DFD
+No SBES records were found in any local or file-server data, so these are
+tested with synthetic records only. Layouts are transcribed from DFD
 3.10 Tables 122-132. Header-only records decode the leading fields present,
 so the extensions the DFD announces (for example 8 reserved u32 fields to
 be added to 10000) round-trip as unparsed bytes until they are defined.

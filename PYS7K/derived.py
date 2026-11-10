@@ -20,11 +20,13 @@ directly from the memory-mapped file for every record at once, without
 decoding each record in Python.
 """
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
 from .bitfields import DETECTION_FLAGS_7027, decode_bits
-from .registry import RECORD_CODECS, decode_record
+from .registry import MIN_DECODED_PROTOCOL, RECORD_CODECS, decode_record
 
 __all__ = [
     "gather_header", "record_times", "decode_text",
@@ -81,7 +83,8 @@ def gather_header(S, record_type):
         ``Record`` (the index row). Empty if there are no such records.
     """
     idx = _index(S)
-    rows = idx[idx.RecordType == record_type]
+    # Records older than protocol 5 have other layouts.
+    rows = idx[(idx.RecordType == record_type) & (idx.ProtocolVersion >= MIN_DECODED_PROTOCOL)]
     codec = RECORD_CODECS[record_type]
     section = codec.rth
     if not len(rows):
@@ -94,7 +97,7 @@ def gather_header(S, record_type):
     try:
         rth_offset = file_bytes[(offsets + 2)[:, None] + np.arange(2)].view("<u2").reshape(-1).astype(np.int64) + 4
         body_end = np.where(rows.OptionalDataOffset.to_numpy() > 0, rows.OptionalDataOffset.to_numpy(),
-                            rows.Size.to_numpy() - 4)
+                            rows.Size.to_numpy() - (4 if getattr(S, "ChecksumTrailer", True) else 0))
         nbytes = int(min(section.size, (body_end - rth_offset).min()))
         dt = section.numpy_dtype(nbytes)
         starts = offsets + rth_offset
@@ -120,21 +123,35 @@ def read_attitude(S, degrees=False):
     1016 sample times are the record time plus TimeDifference / 1000
     (TimeDifference is in milliseconds, Table 33).
 
+    The DFD stores angles in radians. Some third-party writers store
+    degrees instead: a 2011 7125 file with no 7200 header (its 1003/1012/
+    1013 records carry Size - 4 in the checksum field, as HYPACK writes
+    them) has 1013 headings such as 260.8. HYPACK files from 2013 store
+    radians. A ``UserWarning`` is issued when heading magnitudes
+    exceed 2*pi or roll/pitch magnitudes exceed pi, since such values cannot
+    be radians. The values are still returned (and converted, if asked) as
+    if they were radians.
+
     :param degrees: convert roll, pitch and heading from radians to degrees.
     :return: ``{"1012": {...}, "1013": {...}, "1016": {...}}``, with only
         the sources present in the file. Each holds Time and the measured
         values as arrays.
     """
     idx = _index(S)
-    conv = (lambda a: np.rad2deg(a.astype(np.float64))) if degrees else (lambda a: a.astype(np.float64))
+    stored = {"Roll": [], "Pitch": [], "Heading": []}
+
+    def conv(a, name):
+        a = a.astype(np.float64)
+        stored[name].append(a)
+        return np.rad2deg(a) if degrees else a
     out = {}
     if (idx.RecordType == 1012).any():
         g = gather_header(S, 1012)
-        out["1012"] = {"Time": g["Time"], "Roll": conv(g["Roll"]), "Pitch": conv(g["Pitch"]),
+        out["1012"] = {"Time": g["Time"], "Roll": conv(g["Roll"], "Roll"), "Pitch": conv(g["Pitch"], "Pitch"),
                        "Heave": g["Heave"].astype(np.float64)}
     if (idx.RecordType == 1013).any():
         g = gather_header(S, 1013)
-        out["1013"] = {"Time": g["Time"], "Heading": conv(g["Heading"])}
+        out["1013"] = {"Time": g["Time"], "Heading": conv(g["Heading"], "Heading")}
     if (idx.RecordType == 1016).any():
         cols = {k: [] for k in ("TimeDifference", "Roll", "Pitch", "Heave", "Heading")}
         for rec in S.iter_records(1016):
@@ -147,11 +164,16 @@ def read_attitude(S, degrees=False):
         out["1016"] = {
             "Time": np.repeat(rec_times, counts) + td / 1000.0,
             "TimeDifference": td,
-            "Roll": conv(np.concatenate(cols["Roll"])),
-            "Pitch": conv(np.concatenate(cols["Pitch"])),
+            "Roll": conv(np.concatenate(cols["Roll"]), "Roll"),
+            "Pitch": conv(np.concatenate(cols["Pitch"]), "Pitch"),
             "Heave": np.concatenate(cols["Heave"]).astype(np.float64),
-            "Heading": conv(np.concatenate(cols["Heading"])),
+            "Heading": conv(np.concatenate(cols["Heading"]), "Heading"),
         }
+    for name, limit in (("Roll", np.pi), ("Pitch", np.pi), ("Heading", 2 * np.pi)):
+        vals = np.concatenate(stored[name]) if stored[name] else np.zeros(0)
+        if len(vals) and np.nanmax(np.abs(vals)) > limit + 1e-6:
+            warnings.warn("stored %s values up to %.6g exceed %.4g, so they are not radians "
+                          "(the writer probably stored degrees)" % (name, np.nanmax(np.abs(vals)), limit))
     return out
 
 
@@ -172,8 +194,8 @@ def read_navigation(S, degrees=True):
     idx = _index(S)
     conv = np.rad2deg if degrees else (lambda a: a)
     out = {}
-    if (idx.RecordType == 1003).any():
-        g = gather_header(S, 1003)
+    g = gather_header(S, 1003) if (idx.RecordType == 1003).any() else {"Record": []}
+    if len(g["Record"]):
         geo = g["PositionTypeFlag"] == 0
         d = {k: v for k, v in g.items() if k != "Record"}
         d["Latitude"] = np.where(geo, conv(g["LatitudeOrNorthing"]), np.nan)
@@ -228,7 +250,7 @@ def read_detections(S, degrees=False, flags=True):
     dets = {k: [] for k in det_names}
     idx = _index(S)
     for row, buf in S.iter_records(7027, raw=True):
-        rec = decode_record(buf)
+        rec = decode_record(buf, checksum_trailer=getattr(S, "ChecksumTrailer", True))
         rth = rec["RTH"]
         pings["Time"].append(idx.at[row, "Time"])
         pings["DeviceId"].append(rec["Frame"]["DeviceIdentifier"])
@@ -304,7 +326,7 @@ def read_svp(S, degrees=True):
     idx = _index(S)
     out = []
     for row, buf in S.iter_records(1009, raw=True):
-        rec = decode_record(buf)
+        rec = decode_record(buf, checksum_trailer=getattr(S, "ChecksumTrailer", True))
         d = dict(rec["RTH"])
         d["Time"] = float(idx.at[row, "Time"])
         if degrees:
@@ -366,7 +388,7 @@ def read_snippets(S):
     idx = _index(S)
     out = []
     for row, buf in S.iter_records(7028, raw=True):
-        rec = decode_record(buf)
+        rec = decode_record(buf, checksum_trailer=getattr(S, "ChecksumTrailer", True))
         beams = rec["RD"]["Beams"]
         counts = (beams["SnippetEnd"].astype(np.int64) - beams["SnippetStart"].astype(np.int64) + 1)
         splits = np.cumsum(np.clip(counts, 0, None))[:-1]
@@ -387,7 +409,13 @@ def read_watercolumn(record):
       magnitudes (Flags bit 2) are ``factor * log10(magnitude)`` with
       factor CompressionFactor (Flags bit 13) or 40 (Appendix I), so
       ``20 * value / factor`` gives dB. ``SampleRate`` is the RTH sample
-      rate, which already accounts for downsampling.
+      rate, which already accounts for downsampling, and ``FirstSample`` is
+      in those downsampled units: row ``i`` is at two-way travel time
+      ``(FirstSample + i) / SampleRate``. Verified on NORBIT STX (device
+      13016) data from 2024 with 2x downsampling (Flags 0x122): 7027
+      detections land within a few rows of the bottom echo this way. Do
+      not use the 7027 sample numbers directly, since its SamplingRate is
+      the undecimated rate.
     * 7008: each beam's samples placed at rows FirstSample..LastSample
       (relative to the smallest FirstSample), NaN elsewhere. RowColumnFlag
       0 (all samples of a beam together) and 1 (sample-interleaved, which
@@ -464,7 +492,7 @@ def read_sidescan(S, record_type=7007):
     idx = _index(S)
     out = []
     for row, buf in S.iter_records(record_type, raw=True):
-        rec = decode_record(buf)
+        rec = decode_record(buf, checksum_trailer=getattr(S, "ChecksumTrailer", True))
         d = {"PingNumber": rec["RTH"]["PingNumber"], "Time": float(idx.at[row, "Time"]),
              "BeamPosition": rec["RTH"]["BeamPosition"], "CurrentBeamNumber": rec["RTH"]["CurrentBeamNumber"]}
         d.update(rec["RD"])

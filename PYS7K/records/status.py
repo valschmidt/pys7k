@@ -2,8 +2,10 @@
 Status, event, logging and remote-control records added in phase 3:
 7021, 7031, 7050-7055, 7059, 7500-7502, 7504, 7510, 7511.
 
-None of the local sample files contain these records. Each layout is
-transcribed from DFD 3.10 and tested by synthetic round trips. A 7500
+Each layout is transcribed from DFD 3.10. Verified against real data (see
+``PYS7K.verification``): 7021 (RDR 1.2 and 7kCenter 6.x; NBF fields per
+board confirmed), 7501 and 7504 (RecordVersion 2). Tested with synthetic
+records only: 7031, 7050-7055, 7059, 7500, 7502, 7510 and 7511. A 7500
 remote control's record data depends on its command (DFD section 11) and
 is kept as raw bytes in ``RD["Data"]``.
 """
@@ -87,6 +89,13 @@ class _BITE(Codec):
     board: the board header, then NBF bite fields of 79 bytes each
     (Field, NameAndValueText, SensorType, Minimum, Maximum, Value). The DFD
     is not explicit that only NBF fields follow; that is assumed here.
+
+    Verified against real data: 7125 files from 2009-2011 (RDR 1.2) and
+    7kCenter 6.0/6.3 files (2015, 2018) decode with no bytes left over;
+    BITE values fall inside their Minimum/Maximum limits, and the board
+    7KTIME fields (kept as 10 raw bytes; ``s7k.py -p`` shows them as times)
+    agree with the frame time to within a second, which confirms the NBF
+    assumption.
     """
 
     record_type = 7021
@@ -350,13 +359,19 @@ class _RemoteControl(Codec):
 
 _add(_RemoteControl())
 
-# 7501 - Remote Control Acknowledge (Table 111)
+# 7501 - Remote Control Acknowledge (Table 111). Verified against real
+# 20-byte records in 2011 and 2013 7125 files that have no 7200 header.
 _add(HeaderCodec(7501, "Remote Control Acknowledge", [("Ticket", "u32"), ("TrackingNumber", "u64*2")], phase=3))
 # 7502 - Remote Control Not Acknowledge (Table 112)
 _add(HeaderCodec(7502, "Remote Control Not Acknowledge", [
     ("Ticket", "u32"), ("TrackingNumber", "u64*2"), ("ErrorCode", "u32")], phase=3))
 
-# 7504 - Common System Settings (Table 114)
+# 7504 - Common System Settings (Table 114). Verified against 7kCenter 6.0,
+# 6.1 and 6.3 files (RecordVersion 2): fields through TrackerSwathWidth
+# and the multi-detect and snippet settings hold plausible values, and
+# later fields hold the DFD's 0xFB fill. SpreadingLoss in the 7kCenter 6.0
+# file is not a plausible float, so that firmware apparently leaves it
+# unset.
 _add(HeaderCodec(7504, "Common System Settings", [
     ("SonarId", "u64"),
     ("PingNumber", "u32"),

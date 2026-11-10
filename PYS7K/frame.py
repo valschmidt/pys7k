@@ -16,7 +16,10 @@ Checksum flag
 -------------
 The DFD (3.10, Table 5) says Flags bit 0 means "valid checksum", but the
 checksum row of the same table says the checksum "depends on bit 1 of the
-Flags field". Bit 0 is correct. On every sample file checked (7125 data from
+Flags field". Bit 0 is correct. The "bit 1" wording is left over from the
+protocol 2 and 3 frames (DFD 0.42 and 0.50 say "Bit 1 - Valid checksum");
+DFD 0.53 (protocol 4, 2004) moved the flag to bit 0 and every later DFD
+keeps both wordings. On every sample file checked (7125 data from
 2012 and 2016, about 26,000 records) every record with bit 0 set has a
 matching checksum. Records with bit 0 clear (7200, 7300, 7777, and HYPACK's
 7008) store either zero or a value that does not match.

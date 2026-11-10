@@ -11,6 +11,7 @@ A decoded record is one dictionary, built from ``new_record()``::
      "OptionalData": None, or a dictionary (Appendix A layouts),
      "Unparsed": {"Frame": b"", "Body": b"", "OptionalData": b""},
      "Checksum": 1234567,
+     "ChecksumValid": True,   # None when Flags bit 0 says no checksum
     }
 
 Values are exactly what the file stores. No units are converted, no bit
@@ -76,6 +77,7 @@ def new_record(record_type, codec=None):
         "OptionalData": None,
         "Unparsed": {"Frame": b"", "Body": b"", "OptionalData": b""},
         "Checksum": 0,
+        "ChecksumValid": None,
     }
 
 
@@ -136,6 +138,10 @@ class HeaderCodec(Codec):
     def decode(self, body):
         rth, used = self.rth.unpack_prefix(body, 0, len(body))
         return rth, {}, used
+
+    def field_boundaries(self):
+        """Body lengths that end on a field boundary (0 included)."""
+        return [0] + list(self.rth._ends)
 
     def encode(self, record):
         return self.rth.pack(record["RTH"])
